@@ -1,0 +1,96 @@
+From 58479d3078c3c7553e0a09287da2c292ac94bb27 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj1072538@gmail.com>
+Date: Wed, 27 May 2026 14:32:17 +0530
+Subject: [PATCH] io_dmabuf: drop resv lock requirement from map release path
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+io_dmabuf_map_release_work() was taking the dma-buf reservation lock
+around the unmap call. dma_buf_unmap_attachment() does not require the
+reservation lock — only dma_buf_map_attachment() asserts dma_resv_held()
+for dynamic attachments. The lock was an unnecessary constraint carried
+over from the map side of the protocol.
+
+The consequence was a deadlock: KFD restore holds the BO reservation lock
+via drm_exec for the entire duration of BO validation + GPU VM page table
+update. During that window it calls amdgpu_sync_wait() to wait for GPU
+fences. The token fence (at DMA_RESV_USAGE_WRITE) is collected by
+amdgpu_sync_resv() and ends up in that wait. io_dmabuf_map_release_work
+signals the fence before trying to take the resv, so amdgpu_sync_wait()
+can be unblocked. But with the resv required for unmap, the work item
+then immediately blocks on the lock that KFD restore holds, and if KFD
+restore is also waiting for a MOVE fence that depends on the token fence,
+the result is a live dependency cycle that keeps both tasks blocked for
+the hung-task timeout period.
+
+Fix: remove the dma_resv_lock/unlock pair from io_dmabuf_map_release_work
+and remove the corresponding dma_resv_assert_held() from
+nvme_dmabuf_token_unmap(). The release work now signals the fence and
+completes the unmap without acquiring any lock, eliminating the contention
+with KFD restore.
+
+The dma_buf_unmap_attachment() call tears down the NVMe device's IOMMU
+mapping for the buffer. This is safe without the resv because:
+- NVMe DMA has already stopped (percpu refs drained to zero, fence signal
+  is the proof).
+- The IOMMU entries being torn down belong to NVMe's attachment and are
+  independent of the GPU's IOMMU mappings used by any concurrent blit.
+- A concurrent io_dmabuf_create_map() that races with this unmap operates
+  on a new map object with its own sg_table; the two do not share state.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ drivers/nvme/host/pci.c |  2 --
+ lib/io_dmabuf_token.c   | 12 +++++-------
+ 2 files changed, 5 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 01cb74ec81b6..d8248d3222fb 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -2470,8 +2470,6 @@ static void nvme_dmabuf_token_unmap(struct io_dmabuf_token *token,
+ 	struct nvme_dmabuf_map *map = container_of(map_base,
+ 						struct nvme_dmabuf_map, base);
+ 
+-	dma_resv_assert_held(token->dmabuf->resv);
+-
+ 	dma_buf_unmap_attachment(data->attach, map->sgt, token->dir);
+ 	kfree(map->dma_list);
+ }
+diff --git a/lib/io_dmabuf_token.c b/lib/io_dmabuf_token.c
+index 177321f6b2e9..46442df77a88 100644
+--- a/lib/io_dmabuf_token.c
++++ b/lib/io_dmabuf_token.c
+@@ -65,7 +65,6 @@ static void io_dmabuf_map_release_work(struct work_struct *work)
+ 					         release_work);
+ 	struct io_dmabuf_fence *fence = map->fence;
+ 	struct io_dmabuf_token *token = map->token;
+-	struct dma_buf *dmabuf = token->dmabuf;
+ 
+ 	/* the release path must wait for fences */
+ 	if (WARN_ON_ONCE(refcount_read(&token->refs) == 0))
+@@ -75,15 +74,14 @@ static void io_dmabuf_map_release_work(struct work_struct *work)
+ 	refcount_inc(&token->refs);
+ 
+ 	/*
+-	 * There are no more requests using the map, we can signal the fence.
+-	 * It should be done before taking the resv lock as someone could be
+-	 * waiting for the fence while holding the lock.
++	 * Signal first so that GPU blits and other resv waiters are unblocked
++	 * before we attempt any further work. dma_buf_unmap_attachment() does
++	 * not require the reservation lock (only map_attachment does), so we
++	 * do not take it here — taking it would deadlock against any path that
++	 * holds the resv while waiting for this fence (e.g. KFD restore).
+ 	 */
+ 	dma_fence_signal(&fence->base);
+-
+-	dma_resv_lock(dmabuf->resv, NULL);
+ 	token->dev_ops->unmap(token, map);
+-	dma_resv_unlock(dmabuf->resv);
+ 
+ 	dma_fence_put(&fence->base);
+ 	percpu_ref_exit(&map->refs);
+-- 
+2.43.0
+
