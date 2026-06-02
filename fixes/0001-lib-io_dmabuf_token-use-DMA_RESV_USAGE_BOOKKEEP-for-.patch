@@ -1,0 +1,111 @@
+From beaf686c3bacf411291217383f8058cc64afff13 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj1072538@gmail.com>
+Date: Tue, 26 May 2026 08:25:33 +0530
+Subject: [PATCH 1/4] lib/io_dmabuf_token: use DMA_RESV_USAGE_BOOKKEEP for
+ token map-drain fences
+
+The token map-drain fence is an importer-internal revocation/bookkeeping
+fence.  It signals when all in-flight NVMe requests referencing the old
+DMA mapping have dropped their percpu_ref, so the importer can safely
+remap or destroy the token.
+
+Using DMA_RESV_USAGE_KERNEL for this fence is wrong: it causes any kernel
+path that walks reservation fences at KERNEL priority -- most notably the
+AMDGPU KFD restore path in amdgpu_amdkfd_gpuvm_restore_process_bos() --
+to block on outstanding fio/NVMe I/O lifetime.  At the same time,
+io_uring workers may need to create a new map via io_dmabuf_create_map(),
+which also contends on the dma-buf reservation lock used by KFD restore.
+This can form a lock/fence dependency cycle.
+
+Fix by switching all four DMA_RESV_USAGE_KERNEL sites to a named constant
+IO_DMABUF_FENCE_USAGE = DMA_RESV_USAGE_BOOKKEEP:
+
+  - dma_resv_add_fence() in io_dmabuf_drop_map(): the token map-drain
+    fence is now invisible to DMA_RESV_USAGE_KERNEL walkers, so KFD
+    restore no longer acquires a dependency on NVMe I/O drain.
+
+  - dma_resv_wait_timeout() in io_dmabuf_create_map() (pre-lock wait):
+    the wait now drains all reservation fences, including those that
+    ttm_bo_wait_ctx() (which uses BOOKKEEP internally) would block on
+    inside the resv-held map callback.
+
+  - dma_resv_wait_timeout() with timeout=0 in io_dmabuf_create_map()
+    (locked non-blocking check): also fix the comparison from < 0 to
+    <= 0.  dma_resv_wait_timeout() returns 0 when a fence exists but
+    the zero timeout expires, and < 0 only for interrupt/error.  With
+    < 0 the code never retried when a new fence appeared between the
+    pre-lock wait and acquiring the resv; <= 0 correctly triggers the
+    retry in both cases.
+
+  - dma_resv_wait_timeout() in io_dmabuf_token_release_work(): token
+    teardown still correctly waits for its own map-drain fences.
+
+BOOKKEEP (usage value 3) is the broadest dma_resv wait level and includes
+all lower-priority fences, so io_dmabuf serialization against its own
+fences is preserved.  The fence just no longer participates in implicit
+kernel synchronization visible to unrelated subsystems.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ lib/io_dmabuf_token.c | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/lib/io_dmabuf_token.c b/lib/io_dmabuf_token.c
+index 808b5ad33dbc..de858d0fa783 100644
+--- a/lib/io_dmabuf_token.c
++++ b/lib/io_dmabuf_token.c
+@@ -7,6 +7,13 @@
+ #include <linux/io_dmabuf_token.h>
+ #include <linux/dma-resv.h>
+ 
++/*
++ * Importer revocation bookkeeping fences must not participate in implicit
++ * kernel synchronization (DMA_RESV_USAGE_KERNEL). Use BOOKKEEP so that
++ * unrelated kernel paths (e.g. KFD restore) do not wait on NVMe I/O drain.
++ */
++#define IO_DMABUF_FENCE_USAGE	DMA_RESV_USAGE_BOOKKEEP
++
+ struct io_dmabuf_fence {
+ 	struct dma_fence base;
+ 	spinlock_t lock;
+@@ -128,7 +135,7 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
+ 	 * we'll need to wait for fences. Do a bit nicer and try to wait
+ 	 * without the resv lock first.
+ 	 */
+-	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
++	ret = dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_USAGE,
+ 				    true, MAX_SCHEDULE_TIMEOUT);
+ 	if (!ret)
+ 		ret = -EAGAIN;
+@@ -142,8 +149,8 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
+ 		goto out;
+ 	}
+ 
+-	if (dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
+-				  true, 0) < 0) {
++	if (dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_USAGE,
++				  true, 0) <= 0) {
+ 		dma_resv_unlock(dmabuf->resv);
+ 		goto retry;
+ 	}
+@@ -189,7 +196,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
+ 	}
+ 
+ 	dma_resv_add_fence(dmabuf->resv, &map->fence->base,
+-			   DMA_RESV_USAGE_KERNEL);
++			   IO_DMABUF_FENCE_USAGE);
+ 	/*
+ 	 * Delay destruction until all inflight requests using the map are
+ 	 * gone. It'll also signal the fence then.
+@@ -216,7 +223,7 @@ static void io_dmabuf_token_release_work(struct work_struct *work)
+ 	dma_resv_unlock(dmabuf->resv);
+ 
+ 	/* Wait until all maps are destroyed. */
+-	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
++	ret = dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_USAGE,
+ 				    false, MAX_SCHEDULE_TIMEOUT);
+ 
+ 	if (WARN_ON_ONCE(ret <= 0))
+-- 
+2.43.0
+

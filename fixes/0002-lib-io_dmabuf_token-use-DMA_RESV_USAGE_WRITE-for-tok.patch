@@ -1,0 +1,98 @@
+From 79575a258c93eaaf4ac57a0c829c11f4d9c6d2c2 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj1072538@gmail.com>
+Date: Wed, 27 May 2026 10:14:12 +0530
+Subject: [PATCH 2/4] lib/io_dmabuf_token: use DMA_RESV_USAGE_WRITE for token
+ map-drain fences
+
+The previous commit changed the token fence usage to DMA_RESV_USAGE_BOOKKEEP
+to avoid KFD restore collecting it via its KERNEL-level fence scan. That fixed
+the original deadlock but exposed a second one.
+
+The problem: amdgpu_sync_resv() iterates the dma-buf reservation object up to
+DMA_RESV_USAGE_READ (enum value 2). BOOKKEEP has enum value 3. A fence added at
+BOOKKEEP is therefore invisible to any amdgpu_sync_resv() caller, including the
+GPU blit submitted by ttm_bo_validate() when moving a BO back to VRAM during
+KFD restore.
+
+The token fence signals when NVMe DMA writes to the buffer have stopped. If the
+GPU blit does not see it as a dependency, the blit can start reading from the
+source buffer (GTT/system RAM) while NVMe is still writing to it. The resulting
+hardware conflict hangs the GPU ring. The MOVE fence that KFD restore is waiting
+for in amdgpu_sync_wait() never signals, so KFD restore sleeps holding
+dmabuf->resv. The io_dmabuf_map_release_work item, which has already signaled
+the token fence, then blocks trying to take the same resv for the unmap call.
+
+Fix: register the token map-drain fence at DMA_RESV_USAGE_WRITE (enum value 1).
+- WRITE (1) <= READ (2): amdgpu_sync_resv() iterates it, the GPU blit waits for
+  NVMe DMA to stop before reading the source, the ring does not hang.
+- WRITE (1) > KERNEL (0): KFD restore's KERNEL-level scan still does not collect
+  it, so no false dependency on in-flight I/O drain is reintroduced.
+
+Split IO_DMABUF_FENCE_USAGE (fence registration) from IO_DMABUF_FENCE_WAIT_USAGE
+(pre-map and release waits). The wait paths must drain the token fence itself, so
+they use BOOKKEEP which is broad enough to include WRITE-level fences.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ lib/io_dmabuf_token.c | 23 ++++++++++++++++-------
+ 1 file changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/lib/io_dmabuf_token.c b/lib/io_dmabuf_token.c
+index de858d0fa783..177321f6b2e9 100644
+--- a/lib/io_dmabuf_token.c
++++ b/lib/io_dmabuf_token.c
+@@ -8,11 +8,20 @@
+ #include <linux/dma-resv.h>
+ 
+ /*
+- * Importer revocation bookkeeping fences must not participate in implicit
+- * kernel synchronization (DMA_RESV_USAGE_KERNEL). Use BOOKKEEP so that
+- * unrelated kernel paths (e.g. KFD restore) do not wait on NVMe I/O drain.
++ * Token map-drain fences represent "NVMe DMA writes to this buffer have
++ * stopped". Register them at WRITE so that GPU blits moving the BO see the
++ * fence as a dependency (amdgpu_sync_resv iterates up to READ, and WRITE ≤
++ * READ), preventing a blit from reading source data while NVMe is still
++ * writing. WRITE is above KERNEL, so KFD restore's KERNEL-level fence scan
++ * does not pick up these fences and no false dependency on I/O drain is added.
+  */
+-#define IO_DMABUF_FENCE_USAGE	DMA_RESV_USAGE_BOOKKEEP
++#define IO_DMABUF_FENCE_USAGE		DMA_RESV_USAGE_WRITE
++
++/*
++ * Waits in the remap and release paths must drain the token fence itself, so
++ * use BOOKKEEP (broadest) which includes WRITE-level fences.
++ */
++#define IO_DMABUF_FENCE_WAIT_USAGE	DMA_RESV_USAGE_BOOKKEEP
+ 
+ struct io_dmabuf_fence {
+ 	struct dma_fence base;
+@@ -135,7 +144,7 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
+ 	 * we'll need to wait for fences. Do a bit nicer and try to wait
+ 	 * without the resv lock first.
+ 	 */
+-	ret = dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_USAGE,
++	ret = dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_WAIT_USAGE,
+ 				    true, MAX_SCHEDULE_TIMEOUT);
+ 	if (!ret)
+ 		ret = -EAGAIN;
+@@ -149,7 +158,7 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
+ 		goto out;
+ 	}
+ 
+-	if (dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_USAGE,
++	if (dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_WAIT_USAGE,
+ 				  true, 0) <= 0) {
+ 		dma_resv_unlock(dmabuf->resv);
+ 		goto retry;
+@@ -223,7 +232,7 @@ static void io_dmabuf_token_release_work(struct work_struct *work)
+ 	dma_resv_unlock(dmabuf->resv);
+ 
+ 	/* Wait until all maps are destroyed. */
+-	ret = dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_USAGE,
++	ret = dma_resv_wait_timeout(dmabuf->resv, IO_DMABUF_FENCE_WAIT_USAGE,
+ 				    false, MAX_SCHEDULE_TIMEOUT);
+ 
+ 	if (WARN_ON_ONCE(ret <= 0))
+-- 
+2.43.0
+

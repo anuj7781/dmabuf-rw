@@ -1,0 +1,103 @@
+ Yes. I think the clean understanding is:
+
+  AMDGPU waiting on the io_uring/io_dmabuf fence is not inherently wrong. The fence means:
+
+  NVMe may still be using the old DMA mapping.
+  Do not move/reuse the BO memory until that DMA is done.
+
+  So AMDGPU should wait for it before moving the BO.
+
+  The problem is not “AMDGPU waits on the fence.”
+
+  The problem is where and while holding what locks AMDGPU waits on that fence.
+
+  The Deadlock Shape
+
+  In v4, invalidation does this:
+
+  AMDGPU holds dmabuf->resv
+    -> calls invalidate_mappings()
+      -> io_dmabuf adds token fence to dmabuf->resv
+      -> io_dmabuf kills map refs
+      -> returns immediately
+
+  Later, after I/O refs drain:
+
+  io_dmabuf_map_release_work
+    -> signals token fence
+    -> tries to lock dmabuf->resv
+    -> unmaps old attachment
+
+  Meanwhile restore does:
+
+  KFD restore locks BO reservation locks
+  KFD restore waits on token fence while still holding those locks
+
+  So the bad dependency is:
+
+  KFD restore:
+    holds dmabuf->resv
+    waits for io_dmabuf fence
+
+  io_dmabuf cleanup:
+    must run to finish old-map cleanup
+    after signaling, tries to acquire dmabuf->resv
+    blocked by KFD restore
+
+  Even if the fence is signaled before the release worker takes the lock, the design is still fragile because KFD may
+  wait on another token fence that has not reached its release worker yet. With many jobs/BOs, this is a process-wide
+  lock hold problem.
+
+  The Real Bug
+
+  The real bug is the async invalidation model:
+
+  add fence now
+  return to exporter
+  finish unmap later in a worker that needs the same resv lock
+
+  That creates a window where the exporter/KFD can wait on importer progress while still holding locks that the importer
+  cleanup/remap path needs.
+
+  So AMDGPU is doing a reasonable thing by waiting for “DMA stopped.” io_dmabuf is also doing a reasonable thing by
+  signaling after I/O refs drain. The broken part is splitting invalidation into:
+
+  fence added under resv
+  cleanup/unmap deferred outside that lock
+  cleanup later needs to reacquire resv
+
+  The Fix
+
+  Best fix conceptually:
+
+  Do not use an async token fence + later release worker.
+  Make invalidation synchronous.
+
+  That means when AMDGPU calls invalidate_mappings() while holding dmabuf->resv:
+
+  io_dmabuf:
+    remove active map
+    stop new users
+    wait for in-flight I/O refs to drain
+    unmap immediately while resv is still held
+    return
+
+  Then:
+
+  No token fence is added to dmabuf->resv.
+  No release worker needs to reacquire dmabuf->resv.
+  AMDGPU waits directly inside invalidate until old DMA is gone.
+
+  The cost is AMDGPU eviction waits for outstanding NVMe I/O. But that wait is bounded by I/O completion and avoids the
+  lock/fence cycle.
+
+  So the shortest answer:
+
+  AMDGPU waiting is right.
+  The deadlock is caused by io_dmabuf returning from invalidate before unmap is done,
+  then trying to finish unmap later from a worker that needs the same reservation lock
+  AMDGPU/KFD may still be holding while waiting.
+
+  The fix is synchronous invalidation/drain/unmap, or otherwise redesign so the deferred worker never needs to reacquire
+  the exporter’s reservation lock.
+

@@ -1,0 +1,313 @@
+# dmabuf read/write v4: full hung-task crash context for Codex
+
+## Goal for Codex
+
+Please inspect Pavel's `rw-dmabuf-v4` kernel tree and diagnose the hung-task/deadlock seen while running fio with `gpu_dmabuf=1`.
+
+Kernel tree under test:
+
+```text
+https://github.com/isilence/linux/commits/rw-dmabuf-v4/
+```
+
+Note: the Confluence page screenshot title says `Issues in dmabuf (Pavel's v3)`, but this reproducer is reported as running on Pavel v4.
+
+## Workload that triggers the crash/hung-task
+
+From the Confluence page screenshots:
+
+```bash
+fio -filename=/dev/nvme0n1 -direct=1 -size=4G -rw=randread \
+  -numjobs=32 -bs=4K -ioengine=io_uring -gpu_id=0 -iodepth=128 \
+  -name=uring_dmabuf -gpu_dmabuf=1 --registerfiles=1 \
+  --group_reporting --thread
+```
+
+Another reproducer shown on the page:
+
+```bash
+fio -filename=/dev/nvme0n1 -direct=1 -size=4G -rw=randread \
+  -numjobs=32 -bs=4K -ioengine=io_uring -gpu_id=0 -iodepth=256 \
+  -name=uring_dmabuf -gpu_dmabuf=1 --registerfiles=1 \
+  --group_reporting --thread
+```
+
+## High-level symptom
+
+The system reports multiple hung tasks after more than 122 seconds. The repeating pattern is:
+
+```text
+io_dmabuf_map_release_work
+  -> ww_mutex_lock()
+
+fio io-wq workers
+  -> io_dmabuf_create_map()
+  -> ww_mutex_lock()
+
+AMDGPU KFD restore worker
+  -> amdgpu_amdkfd_gpuvm_restore_process_bos()
+  -> amdgpu_vm_update_range()
+  -> amdgpu_sync_wait()
+  -> dma_fence_wait_timeout()
+```
+
+The kernel explicitly reports that the `io_dmabuf_map_release_work` worker and fio `iou-wrk-*` workers are blocked on a mutex likely owned by the AMDGPU KFD restore worker:
+
+```text
+INFO: task kworker/1:0:9841 is blocked on a mutex likely owned by task kworker/u80:1:162.
+INFO: task iou-wrk-9911:9939 is blocked on a mutex likely owned by task kworker/u80:1:162.
+INFO: task iou-wrk-9896:9940 is blocked on a mutex likely owned by task kworker/u80:1:162.
+```
+
+So the likely issue is not NVMe command completion. It looks like a dma-buf / dma-resv / ww_mutex / dma-fence ordering problem involving dynamic dma-buf map creation and release while AMDGPU KFD is restoring process BOs.
+
+## Dmesg / crash dump transcription from page screenshots
+
+### 1. `io_dmabuf_map_release_work` worker blocked on `ww_mutex_lock()`
+
+```text
+[1475.727514] task:kworker/1:0     state:D stack:0     pid:9841 tgid:9841 ppid:2     task_flags:0x4208060 flags:0x00080000
+[1475.727516] Workqueue: events io_dmabuf_map_release_work
+[1475.727518] Call Trace:
+[1475.727519] <TASK>
+[1475.727519] __schedule+0x462/0x19e0
+[1475.727520] ? prb_read_valid+0x27a/0x340
+[1475.727523] schedule+0x27/0xf0
+[1475.727524] schedule_preempt_disabled+0x15/0x30
+[1475.727525] __ww_mutex_lock.constprop.0+0x7f2/0xe90
+[1475.727526] ? __wake_up_klogd+0x75/0xa0
+[1475.727528] __ww_mutex_lock_slowpath+0x16/0x30
+[1475.727529] ww_mutex_lock+0xeb/0x100
+[1475.727530] io_dmabuf_map_release_work+0x82/0x200
+[1475.727532] process_one_work+0x19c/0x420
+[1475.727533] worker_thread+0x1a8/0x330
+[1475.727535] ? __pfx_worker_thread+0x10/0x10
+[1475.727536] kthread+0xfb/0x140
+[1475.727537] ? __pfx_kthread+0x10/0x10
+[1475.727538] ret_from_fork+0x2a3/0x360
+[1475.727539] ? __pfx_kthread+0x10/0x10
+[1475.727540] ret_from_fork_asm+0x1a/0x30
+[1475.727541] </TASK>
+```
+
+The kernel then reports this worker is blocked on a mutex likely owned by the KFD restore worker:
+
+```text
+[1475.727544] INFO: task kworker/1:0:9841 is blocked on a mutex likely owned by task kworker/u80:1:162.
+[1475.727694] task:kworker/u80:1 state:S stack:0 pid:162 tgid:162 ppid:2 task_flags:0x4208860 flags:0x00080000
+[1475.727695] Workqueue: kfd_restore_wq restore_process_worker [amdgpu]
+```
+
+### 2. AMDGPU KFD restore worker waiting on DMA fence
+
+```text
+[1475.727888] Call Trace:
+[1475.727889] <TASK>
+[1475.727889] __schedule+0x462/0x19e0
+[1475.727890] schedule+0x27/0xf0
+[1475.727891] schedule_timeout+0x104/0x110
+[1475.727893] dma_fence_default_wait+0x169/0x280
+[1475.727894] ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[1475.727896] dma_fence_wait_timeout+0xd4/0x1c0
+[1475.727897] amdgpu_sync_wait+0x8c/0x100 [amdgpu]
+[1475.727899] amdgpu_vm_cpu_prepare+0x32/0x50 [amdgpu]
+[1475.728187] amdgpu_vm_update_range+0x1e0/0x940 [amdgpu]
+[1475.728328] amdgpu_vm_bo_update+0x327/0x7b0 [amdgpu]
+[1475.728466] update_gpuvm_pte+0x176/0x4c0 [amdgpu]
+[1475.728659] ? amdgpu_gmc_get_pde_for_bo+0x80/0xc0 [amdgpu]
+[1475.728804] amdgpu_amdkfd_gpuvm_restore_process_bos+0x435/0x9c0 [amdgpu]
+[1475.729000] restore_process_helper+0x28/0xb0 [amdgpu]
+[1475.729185] restore_process_worker+0x2b/0xf0 [amdgpu]
+[1475.729367] process_one_work+0x19c/0x420
+[1475.729369] worker_thread+0x1a8/0x330
+[1475.729370] ? __pfx_worker_thread+0x10/0x10
+[1475.729372] kthread+0xfb/0x140
+[1475.729373] ? __pfx_kthread+0x10/0x10
+[1475.729374] ret_from_fork+0x2a3/0x360
+[1475.729375] ? __pfx_kthread+0x10/0x10
+[1475.729376] ret_from_fork_asm+0x1a/0x30
+[1475.729377] </TASK>
+```
+
+### 3. fio io-wq worker `iou-wrk-9911:9939` blocked in `io_dmabuf_create_map()`
+
+```text
+[1475.729382] INFO: task iou-wrk-9911:9939 blocked for more than 122 seconds.
+[1475.729532] Not tainted 7.0.0+ #56
+[1475.729681] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[1475.729832] task:iou-wrk-9911 state:D stack:0 pid:9939 tgid:9866 ppid:2892 task_flags:0x404050 flags:0x00080000
+[1475.729833] Call Trace:
+[1475.729834] <TASK>
+[1475.729835] __schedule+0x462/0x19e0
+[1475.729836] schedule+0x27/0xf0
+[1475.729837] schedule_preempt_disabled+0x15/0x30
+[1475.729838] __ww_mutex_lock.constprop.0+0x7f2/0xe90
+[1475.729840] ? dma_fence_default_wait+0x1c7/0x280
+[1475.729841] __ww_mutex_lock_slowpath+0x16/0x30
+[1475.729842] ww_mutex_lock+0xeb/0x100
+[1475.729844] io_dmabuf_create_map+0x4b/0x170
+[1475.729845] io_import_reg_buf+0x36d/0x3e0
+[1475.729848] io_read_fixed+0x64/0xb0
+[1475.729849] io_issue_sqe+0x43/0x1b0
+[1475.729851] io_issue_sqe+0x3f/0x550
+[1475.729852] ? lock_timer_base+0x81/0xc0
+[1475.729854] io_wq_submit_work+0x106/0x370
+[1475.729855] io_worker_handle_work+0x141/0x550
+[1475.729856] ? __pfx_process_timeout+0x10/0x10
+[1475.729859] io_wq_worker+0xfd/0x3a0
+[1475.729860] ? finish_task_switch.isra.0+0xcd/0x3d0
+[1475.729861] ? __pfx_io_wq_worker+0x10/0x10
+[1475.729862] ret_from_fork+0x2a3/0x360
+[1475.729864] ? __pfx_io_wq_worker+0x10/0x10
+[1475.729865] ret_from_fork_asm+0x1a/0x30
+[1475.729867] RIP: 0033:0x0
+[1475.729871] R13: 000079f154000b70 R14: 000000000000001a R15: 000079f1c7bd0470
+[1475.729872] </TASK>
+```
+
+The same worker is also reported as blocked on a mutex likely owned by the KFD restore worker:
+
+```text
+[1475.729875] INFO: task iou-wrk-9911:9939 is blocked on a mutex likely owned by task kworker/u80:1:162.
+[1475.730029] task:kworker/u80:1 state:S stack:0 pid:162 tgid:162 ppid:2 task_flags:0x4208860 flags:0x00080000
+[1475.730030] Workqueue: kfd_restore_wq restore_process_worker [amdgpu]
+```
+
+### 4. KFD restore worker stack repeated while owning the mutex
+
+```text
+[1475.730216] Call Trace:
+[1475.730217] <TASK>
+[1475.730217] __schedule+0x462/0x19e0
+[1475.730219] schedule+0x27/0xf0
+[1475.730222] schedule_timeout+0x104/0x110
+[1475.730222] dma_fence_default_wait+0x169/0x280
+[1475.730223] ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[1475.730225] dma_fence_wait_timeout+0xd4/0x1c0
+[1475.730226] amdgpu_sync_wait+0x8c/0x100 [amdgpu]
+[1475.730730] amdgpu_vm_cpu_prepare+0x32/0x50 [amdgpu]
+[1475.730518] amdgpu_vm_update_range+0x1e0/0x940 [amdgpu]
+[1475.730657] amdgpu_vm_bo_update+0x327/0x7b0 [amdgpu]
+[1475.730796] update_gpuvm_pte+0x176/0x4c0 [amdgpu]
+[1475.730990] ? amdgpu_gmc_get_pde_for_bo+0x80/0xc0 [amdgpu]
+[1475.731135] amdgpu_amdkfd_gpuvm_restore_process_bos+0x435/0x9c0 [amdgpu]
+[1475.731328] restore_process_helper+0x28/0xb0 [amdgpu]
+[1475.731511] restore_process_worker+0x2b/0xf0 [amdgpu]
+[1475.731693] process_one_work+0x19c/0x420
+[1475.731695] worker_thread+0x1a8/0x330
+[1475.731696] ? __pfx_worker_thread+0x10/0x10
+[1475.731699] kthread+0xfb/0x140
+[1475.731700] ? __pfx_kthread+0x10/0x10
+[1475.731702] ret_from_fork+0x2a3/0x360
+[1475.731703] ? __pfx_kthread+0x10/0x10
+[1475.731704] ret_from_fork_asm+0x1a/0x30
+[1475.731704] </TASK>
+```
+
+### 5. Another fio io-wq worker `iou-wrk-9896:9940` blocked in `io_dmabuf_create_map()`
+
+```text
+[1475.731855] INFO: task iou-wrk-9896:9940 blocked for more than 122 seconds.
+[1475.732008] Not tainted 7.0.0+ #56
+[1475.732008] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[1475.732161] task:iou-wrk-9896 state:D stack:0 pid:9940 tgid:9866 ppid:2892 task_flags:0x404050 flags:0x00080000
+[1475.732163] Call Trace:
+[1475.732164] <TASK>
+[1475.732165] __schedule+0x462/0x19e0
+[1475.732166] schedule+0x27/0xf0
+[1475.732167] schedule_preempt_disabled+0x15/0x30
+[1475.732169] __ww_mutex_lock.constprop.0+0x7f2/0xe90
+[1475.732170] ? dma_fence_default_wait+0x1c7/0x280
+[1475.732171] __ww_mutex_lock_slowpath+0x16/0x30
+[1475.732179] ww_mutex_lock+0xeb/0x100
+[1475.732180] io_dmabuf_create_map+0x4b/0x170
+[1475.732182] io_import_reg_buf+0x36d/0x3e0
+[1475.732183] io_read_fixed+0x64/0xb0
+[1475.732184] io_issue_sqe+0x43/0x1b0
+[1475.732184] io_issue_sqe+0x3f/0x550
+[1475.732185] ? lock_timer_base+0x81/0xc0
+[1475.732186] io_wq_submit_work+0x106/0x370
+[1475.732187] io_worker_handle_work+0x141/0x550
+[1475.732188] ? __pfx_process_timeout+0x10/0x10
+[1475.732189] io_wq_worker+0xfd/0x3a0
+[1475.732190] ? finish_task_switch.isra.0+0xcd/0x3d0
+[1475.732191] ? __pfx_io_wq_worker+0x10/0x10
+[1475.732192] ret_from_fork+0x2a3/0x360
+[1475.732193] ? __pfx_io_wq_worker+0x10/0x10
+[1475.732195] ret_from_fork_asm+0x1a/0x30
+[1475.732196] RIP: 0033:0x0
+[1475.732201] R13: 000000000000001a R14: 0000000000000000 R15: 000079f1c7c00000
+[1475.732202] </TASK>
+```
+
+Again it is blocked on a mutex likely owned by the KFD restore worker:
+
+```text
+[1475.732204] INFO: task iou-wrk-9896:9940 is blocked on a mutex likely owned by task kworker/u80:1:162.
+[1475.732358] task:kworker/u80:1 state:S stack:0 pid:162 tgid:162 ppid:2 task_flags:0x4208860 flags:0x00080000
+[1475.732359] Workqueue: kfd_restore_wq restore_process_worker [amdgpu]
+```
+
+### 6. Final repeated KFD restore worker stack and suppression
+
+```text
+[1475.732547] Call Trace:
+[1475.732548] <TASK>
+[1475.732550] __schedule+0x462/0x19e0
+[1475.732551] schedule+0x27/0xf0
+[1475.732552] schedule_timeout+0x104/0x110
+[1475.732553] dma_fence_default_wait+0x169/0x280
+[1475.732555] ? __pfx_dma_fence_default_wait_cb+0x10/0x10
+[1475.732556] dma_fence_wait_timeout+0xd4/0x1c0
+[1475.732698] amdgpu_sync_wait+0x8c/0x100 [amdgpu]
+[1475.732845] amdgpu_vm_cpu_prepare+0x32/0x50 [amdgpu]
+[1475.732986] amdgpu_vm_update_range+0x1e0/0x940 [amdgpu]
+[1475.733125] amdgpu_vm_bo_update+0x327/0x7b0 [amdgpu]
+[1475.733317] ? amdgpu_gmc_get_pde_for_bo+0x80/0xc0 [amdgpu]
+[1475.733461] amdgpu_amdkfd_gpuvm_restore_process_bos+0x435/0x9c0 [amdgpu]
+[1475.733654] restore_process_helper+0x28/0xb0 [amdgpu]
+[1475.733837] restore_process_worker+0x2b/0xf0 [amdgpu]
+[1475.734022] process_one_work+0x19c/0x420
+[1475.734023] worker_thread+0x1a8/0x330
+[1475.734025] ? __pfx_worker_thread+0x10/0x10
+[1475.734026] kthread+0xfb/0x140
+[1475.734027] ? __pfx_kthread+0x10/0x10
+[1475.734028] ret_from_fork+0x2a3/0x360
+[1475.734030] ? __pfx_kthread+0x10/0x10
+[1475.734030] ret_from_fork_asm+0x1a/0x30
+[1475.734032] </TASK>
+[1475.734032] Future hung task reports are suppressed, see sysctl kernel.hung_task_warnings
+```
+
+## What Codex should inspect
+
+Please inspect the exact locking and fence order in these code paths:
+
+```text
+io_uring / dmabuf token path:
+  io_dmabuf_create_map()
+  io_dmabuf_map_release_work()
+  io_dmabuf_drop_map()
+  io_dmabuf_token_invalidate_mappings()
+  io_dmabuf_token_release_work()
+  io_import_reg_buf()
+  io_read_fixed()
+
+NVMe dmabuf token path:
+  nvme_dmabuf_token_map()
+  nvme_dmabuf_token_unmap()
+  nvme_dmabuf_invalidate_mappings()
+  nvme_init_dmabuf_token()
+
+AMDGPU / KFD / TTM paths:
+  amdgpu_amdkfd_gpuvm_restore_process_bos()
+  restore_process_worker()
+  amdgpu_vm_cpu_prepare()
+  amdgpu_vm_update_range()
+  amdgpu_vm_bo_update()
+  update_gpuvm_pte/update_gpuvm_ptes()
+  amdgpu_sync_wait()
+  drm_exec_prepare_obj()
+  drm_exec_lock_obj()
+  ttm_bo_delayed_delete()
+```
