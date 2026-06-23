@@ -1,0 +1,210 @@
+From 3b23a47c3aeb84976bbd0fc056edf18dbf8bed4a Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Mon, 22 Jun 2026 18:52:05 +0530
+Subject: [PATCH 2/2] nvme-pci: reuse a prebuilt PRP list for the dmabuf path
+
+For dmabuf-backed I/O the page layout of the mapping is fixed for the
+lifetime of the map, so the PRP entries for any sub-range are already
+known at map time. Build a coherent, device-readable __le64 array of the
+per-page PRP entries once in nvme_dmabuf_token_map() (alongside the
+existing dma_list used for CPU-side syncing).
+
+In the hot path, when the PRP list for a request occupies a contiguous
+slice of that array that does not cross a controller-page boundary, point
+PRP2 straight at the slice and skip the per-request dma_pool_alloc() and
+the entry-by-entry copy. The array is immutable after build and only ever
+read at I/O time, so concurrent in-flight requests can index into it
+without any per-request allocation, copy or locking. Requests whose list
+would cross a page boundary (and thus need chaining) fall back to the
+existing per-request build.
+
+The prebuild is best effort. It spans the whole mapping
+(nr_entries * 8 bytes, e.g. 2 MiB for a 1 GiB dmabuf), so it is skipped
+when that would exceed what a single coherent allocation can satisfy
+(PAGE_SIZE << MAX_PAGE_ORDER), and the allocation uses __GFP_NOWARN since
+failure is non-fatal. In both cases, and when the per-request slice would
+cross a page boundary, the existing per-request PRP list build is used.
+
+The reuse path allocates no descriptor and leaves iod->nr_descriptors
+at zero, so request completion never tries to free the map-owned array;
+it is released in nvme_dmabuf_token_unmap().
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ drivers/nvme/host/pci.c | 72 ++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 60 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index ebc8d4dc5b9a..a77bde341a38 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -402,6 +402,8 @@ struct nvme_dmabuf_token {
+ struct nvme_dmabuf_map {
+ 	struct io_dmabuf_map base;
+ 	dma_addr_t *dma_list;
++	__le64 *prp_array;
++	dma_addr_t prp_array_dma;
+ 	struct sg_table *sgt;
+ 	unsigned nr_entries;
+ };
+@@ -919,21 +921,21 @@ static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
+ 	u64 dma_addr, prp1_dma, prp2_dma;
+ 	struct bio *bio = req->bio;
+ 	struct nvme_dmabuf_map *map;
+-	dma_addr_t *dma_list;
++	dma_addr_t prp_list_start, prp_list_end;
+ 	dma_addr_t prp_dma;
+ 	__le64 *prp_list;
++	unsigned int nprps;
+ 	int i, map_idx;
+ 	int offset;
+ 
+ 	nvme_dmabuf_map_sync(nvmeq->dev, req, false);
+ 
+ 	map = container_of(bio->dmabuf_map, struct nvme_dmabuf_map, base);
+-	dma_list = map->dma_list;
+ 
+ 	offset = bio->bi_iter.bi_bvec_done;
+ 	map_idx = offset / NVME_CTRL_PAGE_SIZE;
+ 	offset &= (NVME_CTRL_PAGE_SIZE - 1);
+-	prp1_dma = dma_list[map_idx++] + offset;
++	prp1_dma = map->dma_list[map_idx++] + offset;
+ 
+ 	length -= (NVME_CTRL_PAGE_SIZE - offset);
+ 	if (length <= 0) {
+@@ -942,10 +944,28 @@ static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
+ 	}
+ 
+ 	if (length <= NVME_CTRL_PAGE_SIZE) {
+-		prp2_dma = dma_list[map_idx];
++		prp2_dma = map->dma_list[map_idx];
+ 		goto done;
+ 	}
+ 
++	/*
++	 * The PRP entries for this transfer are already laid out contiguously
++	 * in the prebuilt coherent prp_array. If the slice we need fits within
++	 * a single controller page (no chaining required), point PRP2 straight
++	 * at it and skip the per-request dma_pool allocation and copy.
++	 */
++	if (map->prp_array) {
++		nprps = DIV_ROUND_UP(length, NVME_CTRL_PAGE_SIZE);
++		prp_list_start = map->prp_array_dma +
++				 map_idx * sizeof(*map->prp_array);
++		prp_list_end = prp_list_start + nprps * sizeof(*map->prp_array);
++		if ((prp_list_start >> NVME_CTRL_PAGE_SHIFT) ==
++		    ((prp_list_end - 1) >> NVME_CTRL_PAGE_SHIFT)) {
++			prp2_dma = prp_list_start;
++			goto done;
++		}
++	}
++
+ 	if (DIV_ROUND_UP(length, NVME_CTRL_PAGE_SIZE) <=
+ 	    NVME_SMALL_POOL_SIZE / sizeof(__le64))
+ 		iod->flags |= IOD_SMALL_DESCRIPTOR;
+@@ -972,7 +992,7 @@ static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
+ 			i = 1;
+ 		}
+ 
+-		dma_addr = dma_list[map_idx++];
++		dma_addr = map->dma_list[map_idx++];
+ 		prp_list[i++] = cpu_to_le64(dma_addr);
+ 
+ 		length -= NVME_CTRL_PAGE_SIZE;
+@@ -2606,27 +2626,45 @@ static struct io_dmabuf_map *nvme_dmabuf_token_map(struct io_dmabuf_token *token
+ {
+ 	struct nvme_dmabuf_token *data = token->dev_priv;
+ 	struct dma_buf_attachment *attach = data->attach;
+-	dma_addr_t *dma_list = NULL;
+ 	unsigned long tmp, i = 0;
+ 	struct nvme_dmabuf_map *map;
+ 	struct scatterlist *sg;
+ 	struct sg_table *sgt;
+ 	unsigned nr_entries;
++	size_t prp_array_size;
+ 	int ret;
+ 
+ 	dma_resv_assert_held(token->dmabuf->resv);
+ 
+-	map = kmalloc(sizeof(*map), GFP_KERNEL);
++	map = kzalloc(sizeof(*map), GFP_KERNEL);
+ 	if (!map)
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	nr_entries = token->dmabuf->size / NVME_CTRL_PAGE_SIZE;
+-	dma_list = kmalloc_array(nr_entries, sizeof(dma_list[0]), GFP_KERNEL);
+-	if (!dma_list) {
++	map->dma_list = kmalloc_array(nr_entries, sizeof(map->dma_list[0]),
++				      GFP_KERNEL);
++	if (!map->dma_list) {
+ 		ret = -ENOMEM;
+ 		goto err;
+ 	}
+ 
++	/*
++	 * Optionally prebuild a coherent, device-readable copy of the PRP
++	 * entries for the whole mapping. The hot path can then reuse a slice
++	 * of it as a PRP list instead of allocating and filling one per
++	 * request. This is best effort:
++	 *  - skip it if the array would exceed what a single coherent
++	 *    allocation can satisfy (the buddy allocator caps one allocation
++	 *    at PAGE_SIZE << MAX_PAGE_ORDER), and
++	 *  - tolerate allocation failure (__GFP_NOWARN); either way the
++	 *    per-request PRP list build is used as the fallback.
++	 */
++	prp_array_size = nr_entries * sizeof(*map->prp_array);
++	if (prp_array_size <= (PAGE_SIZE << MAX_PAGE_ORDER))
++		map->prp_array = dma_alloc_coherent(attach->dev, prp_array_size,
++						    &map->prp_array_dma,
++						    GFP_KERNEL | __GFP_NOWARN);
++
+ 	sgt = dma_buf_map_attachment(attach, token->dir);
+ 	if (IS_ERR(sgt)) {
+ 		ret = PTR_ERR(sgt);
+@@ -2644,7 +2682,10 @@ static struct io_dmabuf_map *nvme_dmabuf_token_map(struct io_dmabuf_token *token
+ 		}
+ 
+ 		while (sg_len) {
+-			dma_list[i++] = dma_addr;
++			map->dma_list[i] = dma_addr;
++			if (map->prp_array)
++				map->prp_array[i] = cpu_to_le64(dma_addr);
++			i++;
+ 			dma_addr += NVME_CTRL_PAGE_SIZE;
+ 			sg_len -= NVME_CTRL_PAGE_SIZE;
+ 		}
+@@ -2654,14 +2695,17 @@ static struct io_dmabuf_map *nvme_dmabuf_token_map(struct io_dmabuf_token *token
+ 	if (ret)
+ 		goto err;
+ 	map->nr_entries = nr_entries;
+-	map->dma_list = dma_list;
+ 	map->sgt = sgt;
+ 	return &map->base;
+ err:
+ 	if (sgt)
+ 		dma_buf_unmap_attachment(attach, sgt, token->dir);
++	if (map->prp_array)
++		dma_free_coherent(attach->dev,
++				  nr_entries * sizeof(*map->prp_array),
++				  map->prp_array, map->prp_array_dma);
++	kfree(map->dma_list);
+ 	kfree(map);
+-	kfree(dma_list);
+ 	return ERR_PTR(ret);
+ }
+ 
+@@ -2675,6 +2719,10 @@ static void nvme_dmabuf_token_unmap(struct io_dmabuf_token *token,
+ 	dma_resv_assert_held(token->dmabuf->resv);
+ 
+ 	dma_buf_unmap_attachment(data->attach, map->sgt, token->dir);
++	if (map->prp_array)
++		dma_free_coherent(data->attach->dev,
++				  map->nr_entries * sizeof(*map->prp_array),
++				  map->prp_array, map->prp_array_dma);
+ 	kfree(map->dma_list);
+ }
+ 
+-- 
+2.43.0
+
