@@ -1,4 +1,4 @@
-From 3b23a47c3aeb84976bbd0fc056edf18dbf8bed4a Mon Sep 17 00:00:00 2001
+From 56bca1471614eae14bde4c4bb9b32ca6e74628c3 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Mon, 22 Jun 2026 18:52:05 +0530
 Subject: [PATCH 2/2] nvme-pci: reuse a prebuilt PRP list for the dmabuf path
@@ -36,7 +36,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
  1 file changed, 60 insertions(+), 12 deletions(-)
 
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
-index ebc8d4dc5b9a..a77bde341a38 100644
+index 5edc7a2c7c3a..a046258b4659 100644
 --- a/drivers/nvme/host/pci.c
 +++ b/drivers/nvme/host/pci.c
 @@ -402,6 +402,8 @@ struct nvme_dmabuf_token {
@@ -112,7 +112,7 @@ index ebc8d4dc5b9a..a77bde341a38 100644
  		prp_list[i++] = cpu_to_le64(dma_addr);
  
  		length -= NVME_CTRL_PAGE_SIZE;
-@@ -2606,27 +2626,45 @@ static struct io_dmabuf_map *nvme_dmabuf_token_map(struct io_dmabuf_token *token
+@@ -2593,27 +2613,45 @@ static struct io_dmabuf_map *nvme_dmabuf_token_map(struct io_dmabuf_token *token
  {
  	struct nvme_dmabuf_token *data = token->dev_priv;
  	struct dma_buf_attachment *attach = data->attach;
@@ -162,7 +162,7 @@ index ebc8d4dc5b9a..a77bde341a38 100644
  	sgt = dma_buf_map_attachment(attach, token->dir);
  	if (IS_ERR(sgt)) {
  		ret = PTR_ERR(sgt);
-@@ -2644,7 +2682,10 @@ static struct io_dmabuf_map *nvme_dmabuf_token_map(struct io_dmabuf_token *token
+@@ -2631,7 +2669,10 @@ static struct io_dmabuf_map *nvme_dmabuf_token_map(struct io_dmabuf_token *token
  		}
  
  		while (sg_len) {
@@ -174,7 +174,7 @@ index ebc8d4dc5b9a..a77bde341a38 100644
  			dma_addr += NVME_CTRL_PAGE_SIZE;
  			sg_len -= NVME_CTRL_PAGE_SIZE;
  		}
-@@ -2654,14 +2695,17 @@ static struct io_dmabuf_map *nvme_dmabuf_token_map(struct io_dmabuf_token *token
+@@ -2641,14 +2682,17 @@ static struct io_dmabuf_map *nvme_dmabuf_token_map(struct io_dmabuf_token *token
  	if (ret)
  		goto err;
  	map->nr_entries = nr_entries;
@@ -194,7 +194,7 @@ index ebc8d4dc5b9a..a77bde341a38 100644
  	return ERR_PTR(ret);
  }
  
-@@ -2675,6 +2719,10 @@ static void nvme_dmabuf_token_unmap(struct io_dmabuf_token *token,
+@@ -2662,6 +2706,10 @@ static void nvme_dmabuf_token_unmap(struct io_dmabuf_token *token,
  	dma_resv_assert_held(token->dmabuf->resv);
  
  	dma_buf_unmap_attachment(data->attach, map->sgt, token->dir);

@@ -1,35 +1,28 @@
-From 534d9721355e699402ef9d7596963e2c0929d82d Mon Sep 17 00:00:00 2001
+From 0fbe23d6fcea7e056efee85913fc176d7cd37cea Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Mon, 22 Jun 2026 18:51:31 +0530
 Subject: [PATCH 1/2] nvme-pci: add SGL support for the dmabuf path
 
 Handle dmabuf-backed requests through the SGL setup path in addition to
-PRP. An SGL descriptor can describe a multi-page physically-contiguous
-run in a single entry, so coalescing the dmabuf's DMA segments into SGL
-entries yields shorter descriptor lists than PRP for large transfers and
-lets the controller validate the requested transfer lengths.
+PRP. The dmabuf sg_table is coalesced into NVMe SGL data descriptors,
+which can cover physically-contiguous multi-page runs with fewer entries.
 
-The coalesced segment count and the first segment are computed once via
-nvme_pci_dmabuf_sgl_nents() in nvme_map_data() and passed into
-nvme_rq_setup_dmabuf_sgl(). This single result drives both the
-SGL-vs-PRP threshold decision and the descriptor build, so the sg_table
-is walked only once for the common single-segment case (a contiguous
-dmabuf coalesces to one entry, emitted inline in the SQE with no
-allocation) and at most twice when a multi-entry list must be emitted.
+Count the coalesced entries once in nvme_map_data(). A single-entry SGL
+is emitted directly in the SQE, while multi-entry requests build a normal
+SGL descriptor list. Optional SGL use still honors sgl_threshold and falls
+back to PRP when the request does not fit the supported SGL list.
 
-SGL_FORCED requests (controller page gaps, user commands, multiple
-integrity segments) cannot fall back to PRP. SGL_SUPPORTED requests use
-SGLs only when the average segment size meets sgl_threshold, otherwise
-the existing PRP path is used.
+Forced-SGL requests cannot use PRPs, so over-fragmented dmabuf requests are
+failed instead of falling back.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 ---
- drivers/nvme/host/pci.c | 210 +++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 206 insertions(+), 4 deletions(-)
+ drivers/nvme/host/pci.c | 197 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 193 insertions(+), 4 deletions(-)
 
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
-index 01cb74ec81b6..ebc8d4dc5b9a 100644
+index 01cb74ec81b6..5edc7a2c7c3a 100644
 --- a/drivers/nvme/host/pci.c
 +++ b/drivers/nvme/host/pci.c
 @@ -1261,12 +1261,18 @@ static blk_status_t nvme_pci_setup_data_prp(struct request *req,
@@ -54,7 +47,7 @@ index 01cb74ec81b6..ebc8d4dc5b9a 100644
  }
  
  static void nvme_pci_sgl_set_seg(struct nvme_sgl_desc *sge,
-@@ -1320,6 +1326,170 @@ static blk_status_t nvme_pci_setup_data_sgl(struct request *req,
+@@ -1320,6 +1326,164 @@ static blk_status_t nvme_pci_setup_data_sgl(struct request *req,
  	return iter->status;
  }
  
@@ -119,12 +112,6 @@ index 01cb74ec81b6..ebc8d4dc5b9a 100644
 +	return nents;
 +}
 +
-+/*
-+ * Build an SGL for a dmabuf-backed request. The coalesced segment count and
-+ * the first segment (@entries, @first_dma, @first_len) are computed once by
-+ * the caller via nvme_pci_dmabuf_sgl_nents() and passed in, so the sg_table is
-+ * walked at most once more here (only when @entries > 1, to emit the list).
-+ */
 +static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
 +					     struct nvme_queue *nvmeq,
 +					     unsigned int entries,
@@ -225,7 +212,7 @@ index 01cb74ec81b6..ebc8d4dc5b9a 100644
  static blk_status_t nvme_pci_setup_data_simple(struct request *req,
  		enum nvme_use_sgl use_sgl)
  {
-@@ -1368,8 +1538,40 @@ static blk_status_t nvme_map_data(struct request *req)
+@@ -1368,8 +1532,33 @@ static blk_status_t nvme_map_data(struct request *req)
  	struct blk_dma_iter iter;
  	blk_status_t ret;
  
@@ -236,22 +223,15 @@ index 01cb74ec81b6..ebc8d4dc5b9a 100644
 +			u32 first_len;
 +			unsigned int entries;
 +
-+			/*
-+			 * Walk the dmabuf sg_table once to get the coalesced
-+			 * segment count (and the first segment); reuse it for
-+			 * both the SGL decision and the actual SGL build.
-+			 */
 +			entries = nvme_pci_dmabuf_sgl_nents(req, &first_dma,
 +							    &first_len);
 +
 +			if (use_sgl == SGL_FORCED) {
 +				ret = nvme_rq_setup_dmabuf_sgl(req, nvmeq,
 +						entries, first_dma, first_len);
-+				/* No PRP fallback when SGLs are forced. */
 +				return ret == BLK_STS_AGAIN ? BLK_STS_IOERR : ret;
 +			}
 +
-+			/* SGL_SUPPORTED: only worth it for large segments. */
 +			if (sgl_threshold && entries &&
 +			    DIV_ROUND_UP(blk_rq_payload_bytes(req), entries) >=
 +			    sgl_threshold) {
