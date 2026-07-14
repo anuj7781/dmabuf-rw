@@ -1,50 +1,53 @@
-From 5024fb38537fc9817e86c5065886457fec3f750f Mon Sep 17 00:00:00 2001
+From d1dff9ebb2fa8e864acbfd0e030fa087757779a1 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj1072538@gmail.com>
 Date: Tue, 14 Jul 2026 20:41:19 +0530
 Subject: [PATCH] debug: trace dmabuf token map-kill, I/O completion, ref-drop,
- and long amdgpu fence stalls
+ fence-signal, and long amdgpu fence stalls
 
 Temporary instrumentation for reproducing the AMDGPU KFD-restore vs.
 io_dmabuf resv/fence deadlock:
 
 - io_dmabuf: log ctx/seqno/owner pid+comm whenever a map's percpu_ref
-  is killed, so a map-kill event can be correlated with the fio job
-  that registered it.
+  is killed (once per map), so a map-kill event can be correlated with
+  the fio job that registered it.
 - io_uring/rw: log ctx/seqno/completing-task pid+comm at io_complete_rw(),
-  before any task-work is scheduled - a genuine I/O completion marker
-  independent of task-work.
+  before any task-work is scheduled - a genuine I/O completion marker,
+  independent of task-work. Fires once per in-flight request draining
+  after a kill, not once per map.
 - io_uring/rsrc: log ctx/seqno/dropping-task pid+comm whenever a
   per-request map ref is dropped on an already-killed (draining) map
-  (io_drop_dmabuf_node).
+  (io_drop_dmabuf_node). Also once per in-flight request, not once per
+  map - only the last one actually drops the count to zero.
+- io_dmabuf: log ctx/seqno once, unconditionally, at the point
+  dma_fence_signal() is called in io_dmabuf_map_release_work() - the
+  one true one-shot "map is fully drained" marker, distinct from the
+  per-request ref-drop log above.
 - amdgpu_sync_wait: log ctx/seqno/driver/timeline/owner/signalled state
   for any single fence wait that takes longer than 3s, without changing
   wait semantics (falls back to an unbounded wait after logging).
 
-Both the completion and ref-drop traces are gated on
-percpu_ref_is_dying() - steady-state activity on live (non-draining)
-maps is silent. Unfiltered, the ref-drop print alone fires on every
-I/O completion across every job, floods dmesg, and perturbs
-completion-path timing enough to stop the deadlock from reproducing.
+The completion and ref-drop traces are gated on percpu_ref_is_dying() -
+steady-state activity on live (non-draining) maps is silent. Unfiltered,
+the ref-drop print alone fires on every I/O completion across every
+job, floods dmesg, and perturbs completion-path timing enough to stop
+the deadlock from reproducing.
 
-Together, "completion (pre task-work)" vs "ref dropped" for the same
-ctx/seqno lets us tell apart two different failure shapes for a
-draining map that never signals: if every expected completion is
-logged but the matching ref-drop never appears, the I/O finished and
-task-work is what never ran; if completions themselves stop appearing,
-the I/O never finished and the problem is upstream of io_uring
-entirely.
+Together: "completion" vs "ref dropped" counts for the same ctx/seqno
+tell apart "I/O finished but task-work never ran" from "I/O itself
+never finished". "fence signalled" (or its absence) is the unambiguous
+one-shot answer to whether the map ever fully drained at all.
 
 Debug-only, not for upstream.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 ---
- drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c | 30 ++++++++++--
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c | 30 +++++++++--
  include/linux/io_dmabuf_token.h          | 10 ++++
  io_uring/rsrc.c                          |  1 +
  io_uring/rw.c                            |  4 ++
- lib/io_dmabuf_token.c                    | 61 ++++++++++++++++++++++++
- 5 files changed, 103 insertions(+), 3 deletions(-)
+ lib/io_dmabuf_token.c                    | 64 ++++++++++++++++++++++++
+ 5 files changed, 106 insertions(+), 3 deletions(-)
 
 diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
 index d6ae9974c952..dd821f71b2a6 100644
@@ -156,10 +159,20 @@ index d50da5fa8bb9..27cdbe0a3e1c 100644
  	io_req_set_res(req, io_fixup_rw_res(req, res), 0);
  	req->io_task_work.func = io_req_rw_complete;
 diff --git a/lib/io_dmabuf_token.c b/lib/io_dmabuf_token.c
-index 808b5ad33dbc..f94725ac1527 100644
+index 808b5ad33dbc..8c2f5588f695 100644
 --- a/lib/io_dmabuf_token.c
 +++ b/lib/io_dmabuf_token.c
-@@ -163,6 +163,63 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
+@@ -63,6 +63,9 @@ static void io_dmabuf_map_release_work(struct work_struct *work)
+ 	 * It should be done before taking the resv lock as someone could be
+ 	 * waiting for the fence while holding the lock.
+ 	 */
++	pr_info("io_dmabuf: fence signalled ctx=%llu, seqno=%llu\n",
++		(unsigned long long)fence->base.context,
++		(unsigned long long)fence->base.seqno);
+ 	dma_fence_signal(&fence->base);
+ 
+ 	dma_resv_lock(dmabuf->resv, NULL);
+@@ -163,6 +166,63 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
  	return map;
  }
  
@@ -223,7 +236,7 @@ index 808b5ad33dbc..f94725ac1527 100644
  static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  {
  	struct dma_buf *dmabuf = token->dmabuf;
-@@ -182,6 +239,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
+@@ -182,6 +242,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  		struct dma_fence *fence = &map->fence->base;
  
  		dma_fence_get(fence);
@@ -231,7 +244,7 @@ index 808b5ad33dbc..f94725ac1527 100644
  		percpu_ref_kill(&map->refs);
  		dma_fence_wait(fence, false);
  		dma_fence_put(fence);
-@@ -194,6 +252,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
+@@ -194,6 +255,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  	 * Delay destruction until all inflight requests using the map are
  	 * gone. It'll also signal the fence then.
  	 */
@@ -239,7 +252,7 @@ index 808b5ad33dbc..f94725ac1527 100644
  	percpu_ref_kill(&map->refs);
  }
  
-@@ -253,6 +312,8 @@ int io_dmabuf_token_create(struct file *file,
+@@ -253,6 +315,8 @@ int io_dmabuf_token_create(struct file *file,
  	token->dir = dir;
  	token->dmabuf = dmabuf;
  	refcount_set(&token->refs, 1);
