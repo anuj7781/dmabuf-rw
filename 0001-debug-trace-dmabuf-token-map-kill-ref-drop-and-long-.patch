@@ -1,8 +1,8 @@
-From 1a5a6a036783f91861e74e691fcb61f70d64782b Mon Sep 17 00:00:00 2001
+From 1237aab7b9f665d703e3256afd25ef4bc667db1e Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj1072538@gmail.com>
 Date: Tue, 14 Jul 2026 20:41:19 +0530
-Subject: [PATCH] debug: trace dmabuf token map-kill and long amdgpu fence
- stalls
+Subject: [PATCH] debug: trace dmabuf token map-kill, ref-drop, and long amdgpu
+ fence stalls
 
 Temporary instrumentation for reproducing the AMDGPU KFD-restore vs.
 io_dmabuf resv/fence deadlock:
@@ -10,6 +10,10 @@ io_dmabuf resv/fence deadlock:
 - io_dmabuf: log ctx/seqno/owner pid+comm whenever a map's percpu_ref
   is killed, so a map-kill event can be correlated with the fio job
   that registered it.
+- io_uring/rsrc: log ctx/seqno/dropping-task pid+comm whenever a
+  per-request map ref is actually dropped (io_drop_dmabuf_node), so a
+  stuck map can be checked for whether its last ref ever drops at all,
+  and if so, when and from which task.
 - amdgpu_sync_wait: log ctx/seqno/driver/timeline/owner/signalled state
   for any single fence wait that takes longer than 3s, without changing
   wait semantics (falls back to an unbounded wait after logging).
@@ -20,9 +24,10 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 ---
  drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c | 30 +++++++++++++++++++++---
- include/linux/io_dmabuf_token.h          |  5 ++++
- lib/io_dmabuf_token.c                    | 17 ++++++++++++++
- 3 files changed, 49 insertions(+), 3 deletions(-)
+ include/linux/io_dmabuf_token.h          |  8 +++++++
+ io_uring/rsrc.c                          |  1 +
+ lib/io_dmabuf_token.c                    | 29 +++++++++++++++++++++++
+ 4 files changed, 65 insertions(+), 3 deletions(-)
 
 diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
 index d6ae9974c952..dd821f71b2a6 100644
@@ -66,7 +71,7 @@ index d6ae9974c952..dd821f71b2a6 100644
  		amdgpu_sync_entry_free(e);
  	}
 diff --git a/include/linux/io_dmabuf_token.h b/include/linux/io_dmabuf_token.h
-index b94bda684812..96aee56fc29e 100644
+index b94bda684812..8621e287bd11 100644
 --- a/include/linux/io_dmabuf_token.h
 +++ b/include/linux/io_dmabuf_token.h
 @@ -3,6 +3,7 @@
@@ -88,11 +93,32 @@ index b94bda684812..96aee56fc29e 100644
  };
  
  int io_dmabuf_token_create(struct file *file,
+@@ -88,5 +93,8 @@ static inline void io_dmabuf_map_drop(struct io_dmabuf_map *map)
+ void io_dmabuf_token_invalidate_mappings(struct io_dmabuf_token *token);
+ int io_dmabuf_init_map(struct io_dmabuf_token *token, struct io_dmabuf_map *map);
+ 
++/* debug only: log when a per-request map ref is actually dropped */
++void io_dmabuf_trace_map_drop(struct io_dmabuf_map *map);
++
+ 
+ #endif
+diff --git a/io_uring/rsrc.c b/io_uring/rsrc.c
+index 1879c312b881..56959510eb59 100644
+--- a/io_uring/rsrc.c
++++ b/io_uring/rsrc.c
+@@ -1239,6 +1239,7 @@ void io_drop_dmabuf_node(struct io_kiocb *req)
+ 	imu = req->buf_node->buf;
+ 	if (WARN_ON_ONCE(!(imu->flags & IO_REGBUF_F_DMABUF)))
+ 		return;
++	io_dmabuf_trace_map_drop(req->dmabuf_map);
+ 	io_dmabuf_map_drop(req->dmabuf_map);
+ }
+ 
 diff --git a/lib/io_dmabuf_token.c b/lib/io_dmabuf_token.c
-index 808b5ad33dbc..e2635abfd305 100644
+index 808b5ad33dbc..91a3a87a97f6 100644
 --- a/lib/io_dmabuf_token.c
 +++ b/lib/io_dmabuf_token.c
-@@ -163,6 +163,19 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
+@@ -163,6 +163,31 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
  	return map;
  }
  
@@ -109,10 +135,22 @@ index 808b5ad33dbc..e2635abfd305 100644
 +		token->owner_pid);
 +}
 +
++/* debug only: log when a per-request map ref is actually dropped */
++void io_dmabuf_trace_map_drop(struct io_dmabuf_map *map)
++{
++	struct dma_fence *fence = &map->fence->base;
++
++	pr_info("io_dmabuf: ref dropped ctx=%llu, seqno=%llu, by=%s:%d\n",
++		(unsigned long long)fence->context,
++		(unsigned long long)fence->seqno,
++		current->comm, current->pid);
++}
++EXPORT_SYMBOL_GPL(io_dmabuf_trace_map_drop);
++
  static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  {
  	struct dma_buf *dmabuf = token->dmabuf;
-@@ -182,6 +195,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
+@@ -182,6 +207,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  		struct dma_fence *fence = &map->fence->base;
  
  		dma_fence_get(fence);
@@ -120,7 +158,7 @@ index 808b5ad33dbc..e2635abfd305 100644
  		percpu_ref_kill(&map->refs);
  		dma_fence_wait(fence, false);
  		dma_fence_put(fence);
-@@ -194,6 +208,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
+@@ -194,6 +220,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  	 * Delay destruction until all inflight requests using the map are
  	 * gone. It'll also signal the fence then.
  	 */
@@ -128,7 +166,7 @@ index 808b5ad33dbc..e2635abfd305 100644
  	percpu_ref_kill(&map->refs);
  }
  
-@@ -253,6 +268,8 @@ int io_dmabuf_token_create(struct file *file,
+@@ -253,6 +280,8 @@ int io_dmabuf_token_create(struct file *file,
  	token->dir = dir;
  	token->dmabuf = dmabuf;
  	refcount_set(&token->refs, 1);
