@@ -1,4 +1,4 @@
-From bcd17264796cc0071c440ef65beb35191570d27c Mon Sep 17 00:00:00 2001
+From c34d83c15b97b560f9b35ca1caa95b36cb37691c Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj1072538@gmail.com>
 Date: Tue, 14 Jul 2026 20:41:19 +0530
 Subject: [PATCH] debug: trace map-kill, I/O drain, fence-signal, lazy-wake
@@ -34,14 +34,14 @@ Debug-only, not for upstream.
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 ---
- drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c |  30 ++++++-
- include/linux/io_dmabuf_token.h          |  31 +++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c |  30 +++++-
+ include/linux/io_dmabuf_token.h          |  31 ++++++
  io_uring/io_uring.c                      |   4 +
  io_uring/rsrc.c                          |   2 +
  io_uring/rw.c                            |   4 +
  io_uring/tw.c                            |   7 ++
- lib/io_dmabuf_token.c                    | 102 +++++++++++++++++++++++
- 7 files changed, 177 insertions(+), 3 deletions(-)
+ lib/io_dmabuf_token.c                    | 115 +++++++++++++++++++++++
+ 7 files changed, 190 insertions(+), 3 deletions(-)
 
 diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
 index d6ae9974c952..dd821f71b2a6 100644
@@ -229,7 +229,7 @@ index fdff81eebc95..236318876263 100644
  	if (nr_tw < nr_wait)
  		return;
 diff --git a/lib/io_dmabuf_token.c b/lib/io_dmabuf_token.c
-index 808b5ad33dbc..4a7210f74496 100644
+index 808b5ad33dbc..f17e59d2bb0c 100644
 --- a/lib/io_dmabuf_token.c
 +++ b/lib/io_dmabuf_token.c
 @@ -63,6 +63,9 @@ static void io_dmabuf_map_release_work(struct work_struct *work)
@@ -242,7 +242,27 @@ index 808b5ad33dbc..4a7210f74496 100644
  	dma_fence_signal(&fence->base);
  
  	dma_resv_lock(dmabuf->resv, NULL);
-@@ -163,6 +166,101 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
+@@ -87,6 +90,19 @@ static void io_dmabuf_map_refs_release(struct percpu_ref *ref)
+ {
+ 	struct io_dmabuf_map *map = container_of(ref, struct io_dmabuf_map, refs);
+ 
++	/*
++	 * debug only: fires exactly once, when the last percpu_ref is dropped.
++	 * Splits the gap between "all I/O completed pre task-work" and
++	 * "fence signalled": if this fires but "fence signalled" doesn't, the
++	 * refs all dropped but release_work never ran (stuck on system_wq). If
++	 * this never fires, a per-request ref drop (io_dmabuf_map_drop, run
++	 * from task-work) never happened - the refcount never reached zero.
++	 */
++	pr_info("io_dmabuf: last ref dropped ctx=%llu, seqno=%llu, by=%s:%d\n",
++		(unsigned long long)map->fence->base.context,
++		(unsigned long long)map->fence->base.seqno,
++		current->comm, current->pid);
++
+ 	/* might sleep, use a worker */
+ 	INIT_WORK(&map->release_work, io_dmabuf_map_release_work);
+ 	queue_work(system_wq, &map->release_work);
+@@ -163,6 +179,101 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
  	return map;
  }
  
@@ -344,7 +364,7 @@ index 808b5ad33dbc..4a7210f74496 100644
  static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  {
  	struct dma_buf *dmabuf = token->dmabuf;
-@@ -182,6 +280,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
+@@ -182,6 +293,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  		struct dma_fence *fence = &map->fence->base;
  
  		dma_fence_get(fence);
@@ -352,7 +372,7 @@ index 808b5ad33dbc..4a7210f74496 100644
  		percpu_ref_kill(&map->refs);
  		dma_fence_wait(fence, false);
  		dma_fence_put(fence);
-@@ -194,6 +293,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
+@@ -194,6 +306,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  	 * Delay destruction until all inflight requests using the map are
  	 * gone. It'll also signal the fence then.
  	 */
@@ -360,7 +380,7 @@ index 808b5ad33dbc..4a7210f74496 100644
  	percpu_ref_kill(&map->refs);
  }
  
-@@ -253,6 +353,8 @@ int io_dmabuf_token_create(struct file *file,
+@@ -253,6 +366,8 @@ int io_dmabuf_token_create(struct file *file,
  	token->dir = dir;
  	token->dmabuf = dmabuf;
  	refcount_set(&token->refs, 1);
