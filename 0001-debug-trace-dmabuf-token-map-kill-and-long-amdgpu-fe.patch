@@ -1,0 +1,142 @@
+From 1a5a6a036783f91861e74e691fcb61f70d64782b Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj1072538@gmail.com>
+Date: Tue, 14 Jul 2026 20:41:19 +0530
+Subject: [PATCH] debug: trace dmabuf token map-kill and long amdgpu fence
+ stalls
+
+Temporary instrumentation for reproducing the AMDGPU KFD-restore vs.
+io_dmabuf resv/fence deadlock:
+
+- io_dmabuf: log ctx/seqno/owner pid+comm whenever a map's percpu_ref
+  is killed, so a map-kill event can be correlated with the fio job
+  that registered it.
+- amdgpu_sync_wait: log ctx/seqno/driver/timeline/owner/signalled state
+  for any single fence wait that takes longer than 3s, without changing
+  wait semantics (falls back to an unbounded wait after logging).
+
+Debug-only, not for upstream.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c | 30 +++++++++++++++++++++---
+ include/linux/io_dmabuf_token.h          |  5 ++++
+ lib/io_dmabuf_token.c                    | 17 ++++++++++++++
+ 3 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+index d6ae9974c952..dd821f71b2a6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
+@@ -462,9 +462,33 @@ int amdgpu_sync_wait(struct amdgpu_sync *sync, bool intr)
+ 	int i, r;
+ 
+ 	hash_for_each_safe(sync->fences, i, tmp, e, node) {
+-		r = dma_fence_wait(e->fence, intr);
+-		if (r)
+-			return r;
++		struct dma_fence *f = e->fence;
++		signed long timeout;
++
++		/* debug only: flag any single fence wait stuck past 3s */
++		timeout = dma_fence_wait_timeout(f, intr, msecs_to_jiffies(3000));
++		if (!timeout) {
++			const char __rcu *drv, *tl;
++
++			rcu_read_lock();
++			drv = dma_fence_driver_name(f);
++			tl = dma_fence_timeline_name(f);
++			pr_info("amdgpu_sync_wait [%s:%d]: LONG STALL >3s on fence ctx=%llu seqno=%llu drv=%s tl=%s owner=%s signaled=%d\n",
++				current->comm, current->pid,
++				(unsigned long long)f->context,
++				(unsigned long long)f->seqno,
++				rcu_dereference(drv), rcu_dereference(tl),
++				amdgpu_sync_get_owner(f) == AMDGPU_FENCE_OWNER_UNDEFINED ?
++					"UNDEFINED" : "other",
++				dma_fence_is_signaled(f));
++			rcu_read_unlock();
++
++			r = dma_fence_wait(f, intr);
++			if (r)
++				return r;
++		} else if (timeout < 0) {
++			return timeout;
++		}
+ 
+ 		amdgpu_sync_entry_free(e);
+ 	}
+diff --git a/include/linux/io_dmabuf_token.h b/include/linux/io_dmabuf_token.h
+index b94bda684812..96aee56fc29e 100644
+--- a/include/linux/io_dmabuf_token.h
++++ b/include/linux/io_dmabuf_token.h
+@@ -3,6 +3,7 @@
+ #define _LINUX_DMA_TOKEN_H
+ 
+ #include <linux/dma-buf.h>
++#include <linux/sched.h>
+ 
+ struct io_dmabuf_fence;
+ struct io_dmabuf_token;
+@@ -53,6 +54,10 @@ struct io_dmabuf_token {
+ 
+ 	void					*dev_priv;
+ 	const struct io_dmabuf_token_dev_ops	*dev_ops;
++
++	/* debug only: registering task, snapshotted for map-kill tracing */
++	pid_t				owner_pid;
++	char				owner_comm[TASK_COMM_LEN];
+ };
+ 
+ int io_dmabuf_token_create(struct file *file,
+diff --git a/lib/io_dmabuf_token.c b/lib/io_dmabuf_token.c
+index 808b5ad33dbc..e2635abfd305 100644
+--- a/lib/io_dmabuf_token.c
++++ b/lib/io_dmabuf_token.c
+@@ -163,6 +163,19 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
+ 	return map;
+ }
+ 
++/* debug only: trace which map/fence/task a kill corresponds to */
++static void io_dmabuf_trace_map_kill(struct io_dmabuf_token *token,
++				     struct io_dmabuf_map *map)
++{
++	struct dma_fence *fence = &map->fence->base;
++
++	pr_info("io_dmabuf: map killed ctx=%llu, seqno=%llu, owner=%s:%d\n",
++		(unsigned long long)fence->context,
++		(unsigned long long)fence->seqno,
++		token->owner_pid ? token->owner_comm : "unknown",
++		token->owner_pid);
++}
++
+ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
+ {
+ 	struct dma_buf *dmabuf = token->dmabuf;
+@@ -182,6 +195,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
+ 		struct dma_fence *fence = &map->fence->base;
+ 
+ 		dma_fence_get(fence);
++		io_dmabuf_trace_map_kill(token, map);
+ 		percpu_ref_kill(&map->refs);
+ 		dma_fence_wait(fence, false);
+ 		dma_fence_put(fence);
+@@ -194,6 +208,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
+ 	 * Delay destruction until all inflight requests using the map are
+ 	 * gone. It'll also signal the fence then.
+ 	 */
++	io_dmabuf_trace_map_kill(token, map);
+ 	percpu_ref_kill(&map->refs);
+ }
+ 
+@@ -253,6 +268,8 @@ int io_dmabuf_token_create(struct file *file,
+ 	token->dir = dir;
+ 	token->dmabuf = dmabuf;
+ 	refcount_set(&token->refs, 1);
++	token->owner_pid = task_pid_nr(current);
++	get_task_comm(token->owner_comm, current);
+ 	get_dma_buf(dmabuf);
+ 
+ 	ret = file->f_op->create_dmabuf_token(file, token);
+-- 
+2.43.0
+
