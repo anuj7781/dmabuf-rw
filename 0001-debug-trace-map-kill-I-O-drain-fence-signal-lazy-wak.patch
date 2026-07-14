@@ -1,4 +1,4 @@
-From 1fe7dc4f009ccd9d2944ccfbb3ef0dfd9e4db231 Mon Sep 17 00:00:00 2001
+From bcd17264796cc0071c440ef65beb35191570d27c Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj1072538@gmail.com>
 Date: Tue, 14 Jul 2026 20:41:19 +0530
 Subject: [PATCH] debug: trace map-kill, I/O drain, fence-signal, lazy-wake
@@ -34,13 +34,14 @@ Debug-only, not for upstream.
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 ---
- drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c | 30 ++++++++-
- include/linux/io_dmabuf_token.h          | 22 +++++++
- io_uring/rsrc.c                          |  2 +
- io_uring/rw.c                            |  4 ++
- io_uring/tw.c                            |  7 +++
- lib/io_dmabuf_token.c                    | 79 ++++++++++++++++++++++++
- 6 files changed, 141 insertions(+), 3 deletions(-)
+ drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c |  30 ++++++-
+ include/linux/io_dmabuf_token.h          |  31 +++++++
+ io_uring/io_uring.c                      |   4 +
+ io_uring/rsrc.c                          |   2 +
+ io_uring/rw.c                            |   4 +
+ io_uring/tw.c                            |   7 ++
+ lib/io_dmabuf_token.c                    | 102 +++++++++++++++++++++++
+ 7 files changed, 177 insertions(+), 3 deletions(-)
 
 diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
 index d6ae9974c952..dd821f71b2a6 100644
@@ -84,7 +85,7 @@ index d6ae9974c952..dd821f71b2a6 100644
  		amdgpu_sync_entry_free(e);
  	}
 diff --git a/include/linux/io_dmabuf_token.h b/include/linux/io_dmabuf_token.h
-index b94bda684812..5c8f19df602a 100644
+index b94bda684812..4a336631e7a6 100644
 --- a/include/linux/io_dmabuf_token.h
 +++ b/include/linux/io_dmabuf_token.h
 @@ -3,6 +3,7 @@
@@ -95,7 +96,7 @@ index b94bda684812..5c8f19df602a 100644
  
  struct io_dmabuf_fence;
  struct io_dmabuf_token;
-@@ -39,6 +40,16 @@ struct io_dmabuf_map {
+@@ -39,6 +40,23 @@ struct io_dmabuf_map {
  	struct work_struct		release_work;
  	struct io_dmabuf_fence		*fence;
  	struct io_dmabuf_token		*token;
@@ -109,10 +110,17 @@ index b94bda684812..5c8f19df602a 100644
 +	 * (io_complete_rw).
 +	 */
 +	atomic_t			io_pending;
++
++	/*
++	 * debug only: 0 -> 1 test-and-set latch so the reissue-requeue path
++	 * (io_free_batch_list, REQ_F_REISSUE) logs at most once per map,
++	 * however many requests bounce through it.
++	 */
++	atomic_t			dbg_reissue_logged;
  };
  
  struct io_dmabuf_token {
-@@ -53,6 +64,10 @@ struct io_dmabuf_token {
+@@ -53,6 +71,10 @@ struct io_dmabuf_token {
  
  	void					*dev_priv;
  	const struct io_dmabuf_token_dev_ops	*dev_ops;
@@ -123,7 +131,7 @@ index b94bda684812..5c8f19df602a 100644
  };
  
  int io_dmabuf_token_create(struct file *file,
-@@ -88,5 +103,12 @@ static inline void io_dmabuf_map_drop(struct io_dmabuf_map *map)
+@@ -88,5 +110,14 @@ static inline void io_dmabuf_map_drop(struct io_dmabuf_map *map)
  void io_dmabuf_token_invalidate_mappings(struct io_dmabuf_token *token);
  int io_dmabuf_init_map(struct io_dmabuf_token *token, struct io_dmabuf_map *map);
  
@@ -133,9 +141,33 @@ index b94bda684812..5c8f19df602a 100644
 +void io_dmabuf_trace_local_work_add(struct io_dmabuf_map *map, unsigned int nr_tw,
 +				    unsigned int nr_tw_prev, unsigned int nr_wait,
 +				    bool will_wake);
++/* debug only: log (once per map) a request re-queued to io-wq via reissue */
++void io_dmabuf_trace_reissue_park(struct io_dmabuf_map *map);
 +
  
  #endif
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index e8a8eef45c3f..2712c00d6f6a 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -56,6 +56,7 @@
+ #include <linux/task_work.h>
+ #include <linux/io_uring.h>
+ #include <linux/io_uring/cmd.h>
++#include <linux/io_dmabuf_token.h>
+ #include <linux/audit.h>
+ #include <linux/security.h>
+ #include <linux/jump_label.h>
+@@ -1095,6 +1096,9 @@ static void io_free_batch_list(struct io_ring_ctx *ctx,
+ 			if (req->flags & REQ_F_REISSUE) {
+ 				node = req->comp_list.next;
+ 				req->flags &= ~REQ_F_REISSUE;
++				if (IS_ENABLED(CONFIG_DMABUF_TOKEN) &&
++				    (req->flags & REQ_F_DROP_DMABUF))
++					io_dmabuf_trace_reissue_park(req->dmabuf_map);
+ 				io_queue_iowq(req);
+ 				continue;
+ 			}
 diff --git a/io_uring/rsrc.c b/io_uring/rsrc.c
 index 1879c312b881..667093b9c20b 100644
 --- a/io_uring/rsrc.c
@@ -197,7 +229,7 @@ index fdff81eebc95..236318876263 100644
  	if (nr_tw < nr_wait)
  		return;
 diff --git a/lib/io_dmabuf_token.c b/lib/io_dmabuf_token.c
-index 808b5ad33dbc..6a41427887d8 100644
+index 808b5ad33dbc..4a7210f74496 100644
 --- a/lib/io_dmabuf_token.c
 +++ b/lib/io_dmabuf_token.c
 @@ -63,6 +63,9 @@ static void io_dmabuf_map_release_work(struct work_struct *work)
@@ -210,7 +242,7 @@ index 808b5ad33dbc..6a41427887d8 100644
  	dma_fence_signal(&fence->base);
  
  	dma_resv_lock(dmabuf->resv, NULL);
-@@ -163,6 +166,78 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
+@@ -163,6 +166,101 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
  	return map;
  }
  
@@ -286,10 +318,33 @@ index 808b5ad33dbc..6a41427887d8 100644
 +}
 +EXPORT_SYMBOL_GPL(io_dmabuf_trace_local_work_add);
 +
++/*
++ * debug only: called from io_free_batch_list()'s REQ_F_REISSUE branch, where
++ * a completed request is re-queued to io-wq *without* dropping its map ref
++ * (io_req_drop_dmabuf is skipped). Logs at most once per map, only for an
++ * already-killed (draining) map. If this fires for a map whose fence never
++ * signals, the map's last ref is riding a request parked in io-wq for
++ * reissue - which never runs if the io-wq workers are all blocked in
++ * io_dmabuf_create_map() on the exporter's resv lock.
++ */
++void io_dmabuf_trace_reissue_park(struct io_dmabuf_map *map)
++{
++	if (!percpu_ref_is_dying(&map->refs))
++		return;
++	if (atomic_cmpxchg(&map->dbg_reissue_logged, 0, 1) != 0)
++		return;
++
++	pr_info("io_dmabuf: reissue re-queue (ref kept) ctx=%llu, seqno=%llu, by=%s:%d\n",
++		(unsigned long long)map->fence->base.context,
++		(unsigned long long)map->fence->base.seqno,
++		current->comm, current->pid);
++}
++EXPORT_SYMBOL_GPL(io_dmabuf_trace_reissue_park);
++
  static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  {
  	struct dma_buf *dmabuf = token->dmabuf;
-@@ -182,6 +257,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
+@@ -182,6 +280,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  		struct dma_fence *fence = &map->fence->base;
  
  		dma_fence_get(fence);
@@ -297,7 +352,7 @@ index 808b5ad33dbc..6a41427887d8 100644
  		percpu_ref_kill(&map->refs);
  		dma_fence_wait(fence, false);
  		dma_fence_put(fence);
-@@ -194,6 +270,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
+@@ -194,6 +293,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  	 * Delay destruction until all inflight requests using the map are
  	 * gone. It'll also signal the fence then.
  	 */
@@ -305,7 +360,7 @@ index 808b5ad33dbc..6a41427887d8 100644
  	percpu_ref_kill(&map->refs);
  }
  
-@@ -253,6 +330,8 @@ int io_dmabuf_token_create(struct file *file,
+@@ -253,6 +353,8 @@ int io_dmabuf_token_create(struct file *file,
  	token->dir = dir;
  	token->dmabuf = dmabuf;
  	refcount_set(&token->refs, 1);
