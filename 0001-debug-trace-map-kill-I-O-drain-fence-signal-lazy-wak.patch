@@ -1,4 +1,4 @@
-From c34d83c15b97b560f9b35ca1caa95b36cb37691c Mon Sep 17 00:00:00 2001
+From 8b2916711987c2ded604afbe00a6554cca766f3f Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj1072538@gmail.com>
 Date: Tue, 14 Jul 2026 20:41:19 +0530
 Subject: [PATCH] debug: trace map-kill, I/O drain, fence-signal, lazy-wake
@@ -6,27 +6,36 @@ Subject: [PATCH] debug: trace map-kill, I/O drain, fence-signal, lazy-wake
 
 Temporary instrumentation for reproducing the AMDGPU KFD-restore vs.
 io_dmabuf resv/fence deadlock. Prior runs with this instrumentation
-proved: for a stuck map, "all I/O completed pre task-work" fires but
-"fence signalled" never does - every request finishes at the
-block-layer level, but the task-work that would drop the last ref and
-let the fence signal never runs. This adds one more print to find out
-*why* that task-work never runs.
+proved: for a stuck map, "all I/O completed pre task-work" fires,
+"local_work_add" shows the lazy-wake was actually issued (will_wake=1),
+but "fence signalled" never does. So task-work does run and the
+submitter task is woken - the gap is elsewhere.
 
 - io_dmabuf: "map killed" - once per map, at kill.
 - io_uring/rsrc + io_dmabuf: "all I/O completed pre task-work" - once
   per map, via a separate io_pending counter independent of ->refs.
 - io_dmabuf: "fence signalled" - once per map, at dma_fence_signal().
+- io_dmabuf: "last ref dropped" - once per map, at the percpu_ref
+  zero-crossing (io_dmabuf_map_refs_release). Splits "all I/O completed
+  pre task-work" from "fence signalled": if this never fires, some
+  per-request ref drop never happened; if it fires but "fence signalled"
+  doesn't, refs all dropped but release_work never ran.
 - io_uring/tw + io_dmabuf: "local_work_add" - logs io_uring's own
   lazy-wake decision (io_req_local_work_add(), IORING_SETUP_DEFER_TASKRUN
   path) at the point a dmabuf request's completion task-work is queued
-  for an already-killed map: nr_tw (pending work count), nr_tw_prev,
-  nr_wait (ctx->cq_wait_nr, the CQE count the waiter is currently
-  blocked on), and will_wake (whether wake_up_state() is about to be
-  called). wake_up_state() is only called when nr_tw crosses nr_wait -
-  if it never does for the request draining the last ref, the waiting
-  task is never woken for that specific completion, which would fully
-  explain the stall despite the task being alive, schedulable, and
-  waking frequently for unrelated reasons.
+  for an already-killed map: nr_tw, nr_tw_prev, nr_wait (ctx->cq_wait_nr),
+  and will_wake (whether wake_up_state() is about to be called).
+- io_uring/io_uring + io_dmabuf: "reissue re-queue (ref kept)" - once
+  per map, from io_free_batch_list()'s REQ_F_REISSUE branch, where a
+  completed request is re-queued to io-wq *without* dropping its map
+  ref. Logs regardless of whether the map is dying yet (map_dying=%d),
+  since the reissue itself typically happens *before* the kill - only
+  the later stall depends on the map having since died and no io-wq
+  worker being free to run the parked retry. If this fires for a map
+  whose fence never signals, the map's last ref is riding a request
+  parked in io-wq for retry, starved because every io-wq worker is
+  instead wedged in io_dmabuf_create_map() on the exporter's resv lock,
+  servicing other/newer requests against the same dmabuf.
 - amdgpu_sync_wait: "LONG STALL >3s" - once per stalled fence wait.
 
 Debug-only, not for upstream.
@@ -40,8 +49,8 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
  io_uring/rsrc.c                          |   2 +
  io_uring/rw.c                            |   4 +
  io_uring/tw.c                            |   7 ++
- lib/io_dmabuf_token.c                    | 115 +++++++++++++++++++++++
- 7 files changed, 190 insertions(+), 3 deletions(-)
+ lib/io_dmabuf_token.c                    | 117 +++++++++++++++++++++++
+ 7 files changed, 192 insertions(+), 3 deletions(-)
 
 diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c
 index d6ae9974c952..dd821f71b2a6 100644
@@ -85,7 +94,7 @@ index d6ae9974c952..dd821f71b2a6 100644
  		amdgpu_sync_entry_free(e);
  	}
 diff --git a/include/linux/io_dmabuf_token.h b/include/linux/io_dmabuf_token.h
-index b94bda684812..4a336631e7a6 100644
+index b94bda684812..6218cb922bc0 100644
 --- a/include/linux/io_dmabuf_token.h
 +++ b/include/linux/io_dmabuf_token.h
 @@ -3,6 +3,7 @@
@@ -141,7 +150,7 @@ index b94bda684812..4a336631e7a6 100644
 +void io_dmabuf_trace_local_work_add(struct io_dmabuf_map *map, unsigned int nr_tw,
 +				    unsigned int nr_tw_prev, unsigned int nr_wait,
 +				    bool will_wake);
-+/* debug only: log (once per map) a request re-queued to io-wq via reissue */
++/* debug only: log (once per map, dying or not) a request re-queued to io-wq via reissue */
 +void io_dmabuf_trace_reissue_park(struct io_dmabuf_map *map);
 +
  
@@ -229,7 +238,7 @@ index fdff81eebc95..236318876263 100644
  	if (nr_tw < nr_wait)
  		return;
 diff --git a/lib/io_dmabuf_token.c b/lib/io_dmabuf_token.c
-index 808b5ad33dbc..f17e59d2bb0c 100644
+index 808b5ad33dbc..fd1c5d771f9c 100644
 --- a/lib/io_dmabuf_token.c
 +++ b/lib/io_dmabuf_token.c
 @@ -63,6 +63,9 @@ static void io_dmabuf_map_release_work(struct work_struct *work)
@@ -262,7 +271,7 @@ index 808b5ad33dbc..f17e59d2bb0c 100644
  	/* might sleep, use a worker */
  	INIT_WORK(&map->release_work, io_dmabuf_map_release_work);
  	queue_work(system_wq, &map->release_work);
-@@ -163,6 +179,101 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
+@@ -163,6 +179,103 @@ struct io_dmabuf_map *io_dmabuf_create_map(struct io_dmabuf_token *token)
  	return map;
  }
  
@@ -341,22 +350,24 @@ index 808b5ad33dbc..f17e59d2bb0c 100644
 +/*
 + * debug only: called from io_free_batch_list()'s REQ_F_REISSUE branch, where
 + * a completed request is re-queued to io-wq *without* dropping its map ref
-+ * (io_req_drop_dmabuf is skipped). Logs at most once per map, only for an
-+ * already-killed (draining) map. If this fires for a map whose fence never
-+ * signals, the map's last ref is riding a request parked in io-wq for
-+ * reissue - which never runs if the io-wq workers are all blocked in
-+ * io_dmabuf_create_map() on the exporter's resv lock.
++ * (io_req_drop_dmabuf is skipped). Logs at most once per map, whether or not
++ * the map is dying yet - a reissue can be queued *before* the kill, in which
++ * case the request re-imports via the REQ_F_DROP_DMABUF fast path (reusing
++ * req->dmabuf_map, no io_dmabuf_create_map call) once an io-wq worker picks
++ * it back up. If this fires for a map whose fence never signals, the map's
++ * last ref is riding a request parked in io-wq for reissue - which never
++ * runs if every io-wq worker is instead wedged in io_dmabuf_create_map() on
++ * the exporter's resv lock, servicing other/newer requests.
 + */
 +void io_dmabuf_trace_reissue_park(struct io_dmabuf_map *map)
 +{
-+	if (!percpu_ref_is_dying(&map->refs))
-+		return;
 +	if (atomic_cmpxchg(&map->dbg_reissue_logged, 0, 1) != 0)
 +		return;
 +
-+	pr_info("io_dmabuf: reissue re-queue (ref kept) ctx=%llu, seqno=%llu, by=%s:%d\n",
++	pr_info("io_dmabuf: reissue re-queue (ref kept) ctx=%llu, seqno=%llu, map_dying=%d, by=%s:%d\n",
 +		(unsigned long long)map->fence->base.context,
 +		(unsigned long long)map->fence->base.seqno,
++		percpu_ref_is_dying(&map->refs),
 +		current->comm, current->pid);
 +}
 +EXPORT_SYMBOL_GPL(io_dmabuf_trace_reissue_park);
@@ -364,7 +375,7 @@ index 808b5ad33dbc..f17e59d2bb0c 100644
  static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  {
  	struct dma_buf *dmabuf = token->dmabuf;
-@@ -182,6 +293,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
+@@ -182,6 +295,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  		struct dma_fence *fence = &map->fence->base;
  
  		dma_fence_get(fence);
@@ -372,7 +383,7 @@ index 808b5ad33dbc..f17e59d2bb0c 100644
  		percpu_ref_kill(&map->refs);
  		dma_fence_wait(fence, false);
  		dma_fence_put(fence);
-@@ -194,6 +306,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
+@@ -194,6 +308,7 @@ static void io_dmabuf_drop_map(struct io_dmabuf_token *token)
  	 * Delay destruction until all inflight requests using the map are
  	 * gone. It'll also signal the fence then.
  	 */
@@ -380,7 +391,7 @@ index 808b5ad33dbc..f17e59d2bb0c 100644
  	percpu_ref_kill(&map->refs);
  }
  
-@@ -253,6 +366,8 @@ int io_dmabuf_token_create(struct file *file,
+@@ -253,6 +368,8 @@ int io_dmabuf_token_create(struct file *file,
  	token->dir = dir;
  	token->dmabuf = dmabuf;
  	refcount_set(&token->refs, 1);
