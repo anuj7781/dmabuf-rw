@@ -1,0 +1,108 @@
+From 5410194055614d72f12c8256b7685adbc24cf3d3 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj1072538@gmail.com>
+Date: Thu, 30 Jul 2026 11:59:42 +0530
+Subject: [PATCH 1/2] nvme-pci: rename nvme_pci_sgl_set_data to
+ nvme_pci_dma_iter_set_sgl
+
+nvme_pci_sgl_set_data() originally took a raw address and length, but
+was converted to take a struct blk_dma_iter, which made its name a
+mismatch for the addr/len based helper the dmabuf SGL path is about to
+introduce.
+
+Rename the iter-based variant to nvme_pci_dma_iter_set_sgl(), freeing
+up nvme_pci_sgl_set_data() to go back to describing what it originally
+did: filling a single SGL data descriptor from an address and length.
+
+Suggested-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ drivers/nvme/host/pci.c | 24 ++++++++++++------------
+ 1 file changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index cbb321fb7c50..cd80da697b75 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1287,18 +1287,18 @@ static blk_status_t nvme_pci_setup_data_prp(struct request *req,
+ 	return BLK_STS_IOERR;
+ }
+ 
+-static void nvme_pci_sgl_set_data_addr(struct nvme_sgl_desc *sge,
+-				       dma_addr_t addr, u32 len)
++static void nvme_pci_sgl_set_data(struct nvme_sgl_desc *sge,
++				  dma_addr_t addr, u32 len)
+ {
+ 	sge->addr = cpu_to_le64(addr);
+ 	sge->length = cpu_to_le32(len);
+ 	sge->type = NVME_SGL_FMT_DATA_DESC << 4;
+ }
+ 
+-static void nvme_pci_sgl_set_data(struct nvme_sgl_desc *sge,
++static void nvme_pci_dma_iter_set_sgl(struct nvme_sgl_desc *sge,
+ 		struct blk_dma_iter *iter)
+ {
+-	nvme_pci_sgl_set_data_addr(sge, iter->addr, iter->len);
++	nvme_pci_sgl_set_data(sge, iter->addr, iter->len);
+ }
+ 
+ static void nvme_pci_sgl_set_seg(struct nvme_sgl_desc *sge,
+@@ -1397,8 +1397,8 @@ static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
+ 	nvme_dmabuf_map_sync_for_device(nvmeq->dev, req);
+ 
+ 	if (entries == 1) {
+-		nvme_pci_sgl_set_data_addr(&iod->cmd.common.dptr.sgl, first_dma,
+-					   first_len);
++		nvme_pci_sgl_set_data(&iod->cmd.common.dptr.sgl, first_dma,
++				      first_len);
+ 		return BLK_STS_OK;
+ 	}
+ 
+@@ -1439,8 +1439,8 @@ static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
+ 			} else {
+ 				if (WARN_ON_ONCE(mapped == entries))
+ 					goto err_free;
+-				nvme_pci_sgl_set_data_addr(&sg_list[mapped++],
+-							   addr, chunk);
++				nvme_pci_sgl_set_data(&sg_list[mapped++],
++						      addr, chunk);
+ 			}
+ 			have = true;
+ 			last_end = addr + chunk;
+@@ -1475,7 +1475,7 @@ static blk_status_t nvme_pci_setup_data_sgl(struct request *req,
+ 	iod->cmd.common.flags = NVME_CMD_SGL_METABUF;
+ 
+ 	if (entries == 1 || blk_rq_dma_map_coalesce(&iod->dma_state)) {
+-		nvme_pci_sgl_set_data(&iod->cmd.common.dptr.sgl, iter);
++		nvme_pci_dma_iter_set_sgl(&iod->cmd.common.dptr.sgl, iter);
+ 		iod->total_len += iter->len;
+ 		return BLK_STS_OK;
+ 	}
+@@ -1497,7 +1497,7 @@ static blk_status_t nvme_pci_setup_data_sgl(struct request *req,
+ 			iter->status = BLK_STS_IOERR;
+ 			break;
+ 		}
+-		nvme_pci_sgl_set_data(&sg_list[mapped++], iter);
++		nvme_pci_dma_iter_set_sgl(&sg_list[mapped++], iter);
+ 		iod->total_len += iter->len;
+ 	} while (blk_rq_dma_map_iter_next(req, nvmeq->dev->dev, iter));
+ 
+@@ -1685,13 +1685,13 @@ static blk_status_t nvme_pci_setup_meta_iter(struct request *req)
+ 	iod->cmd.common.metadata = cpu_to_le64(sgl_dma);
+ 	if (entries == 1) {
+ 		iod->meta_total_len = iter.len;
+-		nvme_pci_sgl_set_data(sg_list, &iter);
++		nvme_pci_dma_iter_set_sgl(sg_list, &iter);
+ 		return BLK_STS_OK;
+ 	}
+ 
+ 	sgl_dma += sizeof(*sg_list);
+ 	do {
+-		nvme_pci_sgl_set_data(&sg_list[++i], &iter);
++		nvme_pci_dma_iter_set_sgl(&sg_list[++i], &iter);
+ 		iod->meta_total_len += iter.len;
+ 	} while (blk_rq_integrity_dma_map_iter_next(req, dev->dev, &iter));
+ 
+-- 
+2.43.0
+

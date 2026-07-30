@@ -1,0 +1,192 @@
+From c7f796456dab89b3cab719682fda00940e60cb67 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj1072538@gmail.com>
+Date: Thu, 30 Jul 2026 12:02:47 +0530
+Subject: [PATCH 2/2] nvme-pci: simplify dmabuf SGL segment counting and
+ descriptor fill
+
+Address review comments from Christoph:
+
+- Drop the explicit "entries > NVME_MAX_SEGS" bailout in
+  nvme_rq_setup_dmabuf_sgl(). A dmabuf bio currently reports nsegs=1
+  to the block layer (bio_split_io_at() treats it as a single
+  contiguous range), so max_segments isn't enforced against the
+  number of sg_table segments a request actually spans. Once the
+  block layer exposes and enforces the real segment count for dmabuf
+  requests, this driver-side check becomes redundant; drop it now in
+  anticipation of that.
+
+- Turn the inner "while (sg_len && remaining)" loops in both
+  nvme_pci_dmabuf_sgl_nents() and nvme_rq_setup_dmabuf_sgl() into
+  do-while loops, since both conditions are already guaranteed true
+  on first entry by the surrounding checks.
+
+- Drop the adjacent-segment coalescing in both the counting and the
+  descriptor-fill function. NVME_MAX_BYTES caps a single command at
+  8 MiB, so merging can only ever save one SGL descriptor on a
+  request that happens to straddle a DMA-contiguous boundary (e.g.
+  amdgpu/Xe's 2 GiB per-chunk VRAM sg_table split, itself unreachable
+  under the current 1 GiB dmabuf registration cap). It also wasn't
+  aware of dma_get_max_seg_size()/dma_get_seg_boundary(), so it could
+  incorrectly re-merge segments the DMA layer had deliberately kept
+  apart. Not worth the complexity for the segment it might save.
+
+- Wrap long lines to fit within 80 columns in nvme_map_data()'s
+  dmabuf SGL/threshold decision, folding the average-segment-size
+  computation into a local, and dropping the two dead BLK_STS_AGAIN
+  checks against nvme_rq_setup_dmabuf_sgl()'s return value, since it
+  can no longer return BLK_STS_AGAIN once the NVME_MAX_SEGS check
+  above is removed.
+
+Suggested-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ drivers/nvme/host/pci.c | 73 +++++++++++++----------------------------
+ 1 file changed, 23 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index cd80da697b75..6cedea9a74f7 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1319,11 +1319,7 @@ static unsigned int nvme_pci_dmabuf_sgl_nents(struct request *req,
+ 	unsigned long tmp;
+ 	size_t offset = bio->bi_iter.bi_offset;
+ 	size_t remaining = blk_rq_payload_bytes(req);
+-	dma_addr_t last_end = 0;
+ 	unsigned int nents = 0;
+-	dma_addr_t dma = 0;
+-	u32 len = 0;
+-	bool have = false;
+ 
+ 	for_each_sgtable_dma_sg(map->sgt, sg, tmp) {
+ 		size_t sg_len = sg_dma_len(sg);
+@@ -1340,32 +1336,24 @@ static unsigned int nvme_pci_dmabuf_sgl_nents(struct request *req,
+ 		sg_len -= offset;
+ 		offset = 0;
+ 
+-		while (sg_len && remaining) {
++		do {
+ 			u32 chunk = min_t(size_t, remaining, sg_len);
+ 
+-			if (!have || last_end != addr) {
+-				nents++;
+-				if (nents == 1) {
+-					dma = addr;
+-					len = chunk;
+-				}
+-			} else if (nents == 1) {
+-				len += chunk;
++			if (!nents) {
++				*first_dma = addr;
++				*first_len = chunk;
+ 			}
++			nents++;
+ 
+-			have = true;
+-			last_end = addr + chunk;
+ 			addr += chunk;
+ 			sg_len -= chunk;
+ 			remaining -= chunk;
+-		}
++		} while (sg_len && remaining);
+ 	}
+ 
+ 	if (unlikely(remaining))
+-	       return 0;
++		return 0;
+ 
+-	*first_dma = dma;
+-	*first_len = len;
+ 	return nents;
+ }
+ 
+@@ -1379,17 +1367,14 @@ static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
+ 	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
+ 	size_t length = blk_rq_payload_bytes(req);
+ 	struct nvme_sgl_desc *sg_list = NULL;
+-	dma_addr_t sgl_dma = 0, last_end = 0;
++	dma_addr_t sgl_dma = 0;
+ 	unsigned int mapped = 0;
+ 	unsigned long tmp;
+ 	struct scatterlist *sg;
+ 	size_t offset, remaining;
+-	bool have = false;
+ 
+ 	if (!entries)
+ 		return BLK_STS_IOERR;
+-	if (entries > NVME_MAX_SEGS)
+-		return BLK_STS_AGAIN;
+ 
+ 	iod->cmd.common.flags = NVME_CMD_SGL_METABUF;
+ 	iod->total_len = length;
+@@ -1429,25 +1414,17 @@ static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
+ 		sg_len -= offset;
+ 		offset = 0;
+ 
+-		while (sg_len && remaining) {
++		do {
+ 			u32 chunk = min_t(size_t, remaining, sg_len);
+ 
+-			if (have && last_end == addr) {
+-				u32 old = le32_to_cpu(sg_list[mapped - 1].length);
++			if (WARN_ON_ONCE(mapped == entries))
++				goto err_free;
++			nvme_pci_sgl_set_data(&sg_list[mapped++], addr, chunk);
+ 
+-				sg_list[mapped - 1].length = cpu_to_le32(old + chunk);
+-			} else {
+-				if (WARN_ON_ONCE(mapped == entries))
+-					goto err_free;
+-				nvme_pci_sgl_set_data(&sg_list[mapped++],
+-						      addr, chunk);
+-			}
+-			have = true;
+-			last_end = addr + chunk;
+ 			addr += chunk;
+ 			sg_len -= chunk;
+ 			remaining -= chunk;
+-		}
++		} while (sg_len && remaining);
+ 	}
+ 
+ 	if (unlikely(remaining))
+@@ -1558,26 +1535,22 @@ static blk_status_t nvme_map_data(struct request *req)
+ 	if (blk_mq_rq_is_dmabuf(req)) {
+ 		if (use_sgl != SGL_UNSUPPORTED) {
+ 			dma_addr_t first_dma;
+-			u32 first_len;
+ 			unsigned int entries;
++			u32 first_len;
++			size_t avg_seg;
+ 
+ 			entries = nvme_pci_dmabuf_sgl_nents(req, &first_dma,
+ 							    &first_len);
+ 
+-			if (use_sgl == SGL_FORCED) {
+-				ret = nvme_rq_setup_dmabuf_sgl(req, nvmeq,
+-								entries, first_dma, first_len);
+-				return ret == BLK_STS_AGAIN ? BLK_STS_IOERR : ret;
+-			}
++			if (use_sgl == SGL_FORCED)
++				return nvme_rq_setup_dmabuf_sgl(req, nvmeq,
++						entries, first_dma, first_len);
+ 
+-			if (sgl_threshold && entries &&
+-			    DIV_ROUND_UP(blk_rq_payload_bytes(req), entries) >=
+-			    sgl_threshold) {
+-				ret = nvme_rq_setup_dmabuf_sgl(req, nvmeq,
+-								entries, first_dma, first_len);
+-				if (ret != BLK_STS_AGAIN)
+-					return ret;
+-			}
++			avg_seg = entries ?
++				DIV_ROUND_UP(blk_rq_payload_bytes(req), entries) : 0;
++			if (sgl_threshold && avg_seg >= sgl_threshold)
++				return nvme_rq_setup_dmabuf_sgl(req, nvmeq,
++						entries, first_dma, first_len);
+ 		}
+ 
+ 		return nvme_rq_setup_dmabuf_map(req, nvmeq);
+-- 
+2.43.0
+
