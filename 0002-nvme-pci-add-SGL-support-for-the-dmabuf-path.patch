@@ -1,40 +1,18 @@
-From 995a1ed592a95774f9334fd32af142a30bee4b4e Mon Sep 17 00:00:00 2001
-From: Anuj Gupta <anuj1072538@gmail.com>
-Date: Thu, 30 Jul 2026 18:11:24 +0530
+From 5fe6c52218f8079f0a7abe2c3e2d03038792b4d2 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Fri, 31 Jul 2026 08:46:53 +0530
 Subject: [PATCH 2/2] nvme-pci: add SGL support for the dmabuf path
 
 Add SGL support in addition to PRP for dmabuf-backed requests,
-building the descriptor list directly from the mapping's sg_table.
+building the descriptor list from the mapping's sg_table.
 
-nvme_pci_dmabuf_sgl_nents() walks the sg_table to count the DMA
-segments covered by a request's [bi_offset, bi_offset + payload)
-slice of the dmabuf mapping and returns the first segment's address
-and length; a request only covers a sub-range of the mapping, so the
-sg_table's own nents (the whole-buffer segment count) can't be used
-directly for the entries==1 fast path or the average-segment-size
-threshold below.
-
-nvme_rq_setup_dmabuf_sgl() fills the SGL descriptor(s) for that same
-slice, inlining a single data descriptor when the slice maps to one
-segment and building a descriptor list otherwise.
-
-nvme_rq_setup_dmabuf() is the entry point from nvme_map_data(): it
-computes the segment count, forces SGL when SGL_FORCED, uses SGL when
-the average segment size meets sgl_threshold, and otherwise falls
-back to the plain dmabuf PRP-style mapping.
-
-Forced SGL returns an error on any failure; optional SGL falls back
-to the PRP path.
-
-Suggested-by: Christoph Hellwig <hch@lst.de>
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
-Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 ---
- drivers/nvme/host/pci.c | 166 +++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 162 insertions(+), 4 deletions(-)
+ drivers/nvme/host/pci.c | 153 ++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 149 insertions(+), 4 deletions(-)
 
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
-index 4087666f93d7..5fd2b5bb6374 100644
+index 4087666f93d7..3ae261a8d0cb 100644
 --- a/drivers/nvme/host/pci.c
 +++ b/drivers/nvme/host/pci.c
 @@ -1287,12 +1287,18 @@ static blk_status_t nvme_pci_setup_data_prp(struct request *req,
@@ -42,7 +20,7 @@ index 4087666f93d7..5fd2b5bb6374 100644
  }
  
 +static void nvme_pci_sgl_set_data(struct nvme_sgl_desc *sge,
-+				  dma_addr_t addr, u32 len)
++		dma_addr_t addr, u32 len)
 +{
 +	sge->addr = cpu_to_le64(addr);
 +	sge->length = cpu_to_le32(len);
@@ -59,12 +37,11 @@ index 4087666f93d7..5fd2b5bb6374 100644
  }
  
  static void nvme_pci_sgl_set_seg(struct nvme_sgl_desc *sge,
-@@ -1303,6 +1309,158 @@ static void nvme_pci_sgl_set_seg(struct nvme_sgl_desc *sge,
+@@ -1303,6 +1309,145 @@ static void nvme_pci_sgl_set_seg(struct nvme_sgl_desc *sge,
  	sge->type = NVME_SGL_FMT_LAST_SEG_DESC << 4;
  }
  
-+static unsigned int nvme_pci_dmabuf_sgl_nents(struct request *req,
-+		dma_addr_t *first_dma, u32 *first_len)
++static unsigned int nvme_pci_dmabuf_sgl_nents(struct request *req)
 +{
 +	struct bio *bio = req->bio;
 +	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
@@ -76,7 +53,6 @@ index 4087666f93d7..5fd2b5bb6374 100644
 +
 +	for_each_sgtable_dma_sg(map->sgt, sg, tmp) {
 +		size_t sg_len = sg_dma_len(sg);
-+		dma_addr_t addr = sg_dma_address(sg);
 +
 +		if (!remaining)
 +			break;
@@ -85,20 +61,13 @@ index 4087666f93d7..5fd2b5bb6374 100644
 +			continue;
 +		}
 +
-+		addr += offset;
 +		sg_len -= offset;
 +		offset = 0;
 +
 +		do {
-+			u32 chunk = min_t(size_t, remaining, sg_len);
++			size_t chunk = min(remaining, sg_len);
 +
-+			if (!nents) {
-+				*first_dma = addr;
-+				*first_len = chunk;
-+			}
 +			nents++;
-+
-+			addr += chunk;
 +			sg_len -= chunk;
 +			remaining -= chunk;
 +		} while (sg_len && remaining);
@@ -111,19 +80,21 @@ index 4087666f93d7..5fd2b5bb6374 100644
 +}
 +
 +static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
-+		struct nvme_queue *nvmeq, unsigned int entries,
-+		dma_addr_t first_dma, u32 first_len)
++		struct nvme_queue *nvmeq, unsigned int entries)
 +{
 +	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 +	struct bio *bio = req->bio;
 +	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
 +	size_t length = blk_rq_payload_bytes(req);
-+	struct nvme_sgl_desc *sg_list = NULL;
++	/* entries == 1: write straight into the inline data descriptor */
++	struct nvme_sgl_desc *sg_list = &iod->cmd.common.dptr.sgl;
++	bool pooled = entries > 1;
 +	dma_addr_t sgl_dma = 0;
 +	unsigned int mapped = 0;
 +	unsigned long tmp;
 +	struct scatterlist *sg;
-+	size_t offset, remaining;
++	size_t offset = bio->bi_iter.bi_offset;
++	size_t remaining = length;
 +
 +	if (!entries)
 +		return BLK_STS_IOERR;
@@ -133,23 +104,16 @@ index 4087666f93d7..5fd2b5bb6374 100644
 +
 +	nvme_dmabuf_map_sync_for_device(nvmeq->dev, req);
 +
-+	if (entries == 1) {
-+		nvme_pci_sgl_set_data(&iod->cmd.common.dptr.sgl, first_dma,
-+				      first_len);
-+		return BLK_STS_OK;
++	if (pooled) {
++		if (entries <= NVME_SMALL_POOL_SIZE / sizeof(*sg_list))
++			iod->flags |= IOD_SMALL_DESCRIPTOR;
++
++		sg_list = dma_pool_alloc(nvme_dma_pool(nvmeq, iod), GFP_ATOMIC,
++					 &sgl_dma);
++		if (!sg_list)
++			return BLK_STS_RESOURCE;
++		iod->descriptors[iod->nr_descriptors++] = sg_list;
 +	}
-+
-+	if (entries <= NVME_SMALL_POOL_SIZE / sizeof(*sg_list))
-+		iod->flags |= IOD_SMALL_DESCRIPTOR;
-+
-+	sg_list = dma_pool_alloc(nvme_dma_pool(nvmeq, iod), GFP_ATOMIC,
-+				 &sgl_dma);
-+	if (!sg_list)
-+		return BLK_STS_RESOURCE;
-+	iod->descriptors[iod->nr_descriptors++] = sg_list;
-+
-+	offset = bio->bi_iter.bi_offset;
-+	remaining = length;
 +
 +	for_each_sgtable_dma_sg(map->sgt, sg, tmp) {
 +		size_t sg_len = sg_dma_len(sg);
@@ -182,35 +146,36 @@ index 4087666f93d7..5fd2b5bb6374 100644
 +	if (unlikely(remaining))
 +		goto err_free;
 +
-+	nvme_pci_sgl_set_seg(&iod->cmd.common.dptr.sgl, sgl_dma, mapped);
++	if (pooled)
++		nvme_pci_sgl_set_seg(&iod->cmd.common.dptr.sgl, sgl_dma,
++				     mapped);
 +	return BLK_STS_OK;
 +err_free:
-+	iod->nr_descriptors--;
-+	dma_pool_free(nvme_dma_pool(nvmeq, iod), sg_list, sgl_dma);
++	if (pooled) {
++		iod->nr_descriptors--;
++		dma_pool_free(nvme_dma_pool(nvmeq, iod), sg_list, sgl_dma);
++	}
 +	return BLK_STS_IOERR;
 +}
 +
 +static blk_status_t nvme_rq_setup_dmabuf(struct request *req,
 +		struct nvme_queue *nvmeq, enum nvme_use_sgl use_sgl)
 +{
-+	dma_addr_t first_dma;
 +	unsigned int entries;
-+	u32 first_len;
 +	size_t avg_seg;
 +
 +	if (use_sgl == SGL_UNSUPPORTED)
 +		return nvme_rq_setup_dmabuf_map(req, nvmeq);
 +
-+	entries = nvme_pci_dmabuf_sgl_nents(req, &first_dma, &first_len);
++	entries = nvme_pci_dmabuf_sgl_nents(req);
 +
 +	if (use_sgl == SGL_FORCED)
-+		return nvme_rq_setup_dmabuf_sgl(req, nvmeq, entries,
-+						first_dma, first_len);
++		return nvme_rq_setup_dmabuf_sgl(req, nvmeq, entries);
 +
-+	avg_seg = entries ? DIV_ROUND_UP(blk_rq_payload_bytes(req), entries) : 0;
++	avg_seg = entries ?
++		DIV_ROUND_UP(blk_rq_payload_bytes(req), entries) : 0;
 +	if (sgl_threshold && avg_seg >= sgl_threshold)
-+		return nvme_rq_setup_dmabuf_sgl(req, nvmeq, entries,
-+						first_dma, first_len);
++		return nvme_rq_setup_dmabuf_sgl(req, nvmeq, entries);
 +
 +	return nvme_rq_setup_dmabuf_map(req, nvmeq);
 +}
@@ -218,7 +183,7 @@ index 4087666f93d7..5fd2b5bb6374 100644
  static blk_status_t nvme_pci_setup_data_sgl(struct request *req,
  		struct blk_dma_iter *iter)
  {
-@@ -1398,7 +1556,7 @@ static blk_status_t nvme_map_data(struct request *req)
+@@ -1398,7 +1543,7 @@ static blk_status_t nvme_map_data(struct request *req)
  	blk_status_t ret;
  
  	if (blk_mq_rq_is_dmabuf(req))
