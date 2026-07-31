@@ -1,4 +1,4 @@
-From 5fe6c52218f8079f0a7abe2c3e2d03038792b4d2 Mon Sep 17 00:00:00 2001
+From 9cd98a0cea13961492ba85af0dc7aeba8cc226ac Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Fri, 31 Jul 2026 08:46:53 +0530
 Subject: [PATCH 2/2] nvme-pci: add SGL support for the dmabuf path
@@ -12,7 +12,7 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  1 file changed, 149 insertions(+), 4 deletions(-)
 
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
-index 4087666f93d7..3ae261a8d0cb 100644
+index 4087666f93d7..9aa914165eb3 100644
 --- a/drivers/nvme/host/pci.c
 +++ b/drivers/nvme/host/pci.c
 @@ -1287,12 +1287,18 @@ static blk_status_t nvme_pci_setup_data_prp(struct request *req,
@@ -86,7 +86,6 @@ index 4087666f93d7..3ae261a8d0cb 100644
 +	struct bio *bio = req->bio;
 +	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
 +	size_t length = blk_rq_payload_bytes(req);
-+	/* entries == 1: write straight into the inline data descriptor */
 +	struct nvme_sgl_desc *sg_list = &iod->cmd.common.dptr.sgl;
 +	bool pooled = entries > 1;
 +	dma_addr_t sgl_dma = 0;
@@ -104,6 +103,7 @@ index 4087666f93d7..3ae261a8d0cb 100644
 +
 +	nvme_dmabuf_map_sync_for_device(nvmeq->dev, req);
 +
++	/* entries == 1 fits in the inline descriptor; more needs a pool. */
 +	if (pooled) {
 +		if (entries <= NVME_SMALL_POOL_SIZE / sizeof(*sg_list))
 +			iod->flags |= IOD_SMALL_DESCRIPTOR;
