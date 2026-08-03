@@ -1,0 +1,283 @@
+From d49d97186a52a15122d0d44ec9d4506bc6d0e40e Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Mon, 3 Aug 2026 15:23:07 +0530
+Subject: [PATCH] tests/rw-dmabuf: add NVMe uring_cmd passthrough coverage
+
+Exercise the same dmabuf registered buffer via NVMe uring_cmd
+passthrough (IORING_URING_CMD_FIXED), in addition to the existing
+READ_FIXED/WRITE_FIXED coverage:
+
+- test_passthrough_io()/test_passthrough_reads()/
+  test_passthrough_writes() build raw NVMe read/write commands
+  against buf_index 0, reusing the sweep of offsets/sizes already
+  used for the FIXED tests. Unlike READ_FIXED/WRITE_FIXED, cqe->res
+  is the raw NVMe completion status (0 on success) rather than a
+  byte count, and the command carries the LBA/block count directly
+  since there's no block layer translating a byte range for us -
+  hence pulling in nvme_get_info() from nvme.h for nsid/lba_shift.
+- The buffer offset (cmd->addr) is a byte offset into the dmabuf,
+  not a pointer - dmabuf regbufs have imu->ubuf == 0 kernel side,
+  unlike normal registered buffers.
+- test_passthrough_metadata_rejected() checks that combining a
+  dmabuf-backed fixed buffer with metadata_len is rejected with
+  -EOPNOTSUPP, matching the kernel-side restriction.
+
+Passthrough support requires nvme_get_info() to succeed against the
+target device; if it doesn't, the passthrough portion is skipped
+without failing the rest of the test.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ test/rw-dmabuf.c | 222 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 222 insertions(+)
+
+diff --git a/test/rw-dmabuf.c b/test/rw-dmabuf.c
+index 9a33949a..0ad5b68b 100644
+--- a/test/rw-dmabuf.c
++++ b/test/rw-dmabuf.c
+@@ -16,6 +16,7 @@
+ 
+ #include "liburing.h"
+ #include "helpers.h"
++#include "nvme.h"
+ 
+ static int udmabuf_devfd;
+ static int page_size;
+@@ -416,6 +417,192 @@ static int test_read(struct io_uring *ring, struct t_dev *dev, struct t_buf *buf
+ 	return verify_data(buf, buf_off, f_off, size);
+ }
+ 
++/*
++ * NVMe uring_cmd passthrough read/write, using the same dmabuf registered
++ * buffer as the FIXED read/write tests above. Unlike READ_FIXED/WRITE_FIXED,
++ * cqe->res is the raw NVMe completion status (0 == success), not a byte
++ * count, and offsets/sizes must be LBA-aligned since this builds the raw
++ * NVMe command ourselves instead of letting the block layer translate it.
++ */
++static int test_passthrough_io(struct io_uring *ring, struct t_dev *dev,
++			       struct t_buf *buf, bool write, size_t f_off,
++			       size_t buf_off, size_t size)
++{
++	struct nvme_uring_cmd *cmd;
++	struct io_uring_cqe *cqe;
++	struct io_uring_sqe *sqe;
++	__u64 slba;
++	__u32 nlb;
++	int ret;
++
++	assert(!(f_off & ((1U << lba_shift) - 1)));
++	assert(!(size & ((1U << lba_shift) - 1)));
++	slba = f_off >> lba_shift;
++	nlb = (size >> lba_shift) - 1;
++
++	sqe = io_uring_get_sqe(ring);
++	io_uring_prep_uring_cmd(sqe, NVME_URING_CMD_IO, dev->fd);
++	sqe->buf_index = 0;
++	sqe->uring_cmd_flags |= IORING_URING_CMD_FIXED;
++	sqe->user_data = 42;
++
++	cmd = (struct nvme_uring_cmd *)sqe->cmd;
++	memset(cmd, 0, sizeof(*cmd));
++	cmd->opcode = write ? nvme_cmd_write : nvme_cmd_read;
++	cmd->nsid = nsid;
++	cmd->cdw10 = slba & 0xffffffff;
++	cmd->cdw11 = slba >> 32;
++	cmd->cdw12 = nlb;
++	/*
++	 * Registered dmabuf buffers have imu->ubuf == 0 kernel side, so
++	 * this is a byte offset into the dmabuf, not a real pointer.
++	 */
++	cmd->addr = (__u64)buf_off;
++	cmd->data_len = size;
++
++	ret = io_uring_submit(ring);
++	if (ret <= 0) {
++		fprintf(stderr, "sqe submit failed: %d\n", ret);
++		return -1;
++	}
++	ret = io_uring_wait_cqe(ring, &cqe);
++	if (ret < 0) {
++		fprintf(stderr, "wait completion %d\n", ret);
++		return -1;
++	}
++	if (cqe->res != 0) {
++		fprintf(stderr, "invalid passthrough result %i\n", cqe->res);
++		return -1;
++	}
++	io_uring_cqe_seen(ring, cqe);
++
++	if (write)
++		return 0;
++	return verify_data(buf, buf_off, f_off, size);
++}
++
++static int test_passthrough_reads(struct io_uring *ring, struct t_dev *dev,
++				  struct t_buf *buf)
++{
++	size_t f_offs[] = { 0, 1, 2, 7 };
++	size_t buf_offs[] = { 0, 1, 2, 7 };
++	size_t io_sizes[] = { 1, 2, 3, 15, 7, 16, 32, 31 };
++	int ret;
++
++	ret = test_passthrough_io(ring, dev, buf, false, 0, 0, dev->block_size);
++	if (ret) {
++		fprintf(stderr, "test_passthrough_io() single read failed\n");
++		return ret;
++	}
++
++	for (int foff_idx = 0; foff_idx < ARRAY_SIZE(f_offs); foff_idx++) {
++		for (int buf_idx = 0; buf_idx < ARRAY_SIZE(buf_offs); buf_idx++) {
++			for (int size_idx = 0; size_idx < ARRAY_SIZE(io_sizes); size_idx++) {
++				size_t f_off = f_offs[foff_idx] * dev->block_size;
++				size_t buf_off = buf_offs[buf_idx] * dev->block_size;
++				size_t size = io_sizes[size_idx] * dev->block_size;
++
++				assert(buf_off + size <= buf->size);
++
++				ret = test_passthrough_io(ring, dev, buf, false,
++							  f_off, buf_off, size);
++				if (ret) {
++					fprintf(stderr, "test_passthrough_io() read failed ret=%i, foff=%li, off=%li, io=%li\n",
++						ret, (long)f_off, (long)buf_off,
++						(long)size);
++					return ret;
++				}
++			}
++		}
++	}
++
++	return 0;
++}
++
++static int test_passthrough_writes(struct io_uring *ring, struct t_dev *dev,
++				   struct t_buf *buf)
++{
++	const int nr_reqs = 16;
++	size_t off = 0;
++	int ret;
++
++	ret = fill_device(dev, FILL_ZERO);
++	if (ret) {
++		fprintf(stderr, "fill_device failed %i\n", ret);
++		return T_EXIT_FAIL;
++	}
++
++	assert(dev->size % (nr_reqs * dev->block_size) == 0);
++
++	while (off < dev->size) {
++		for (int i = 0; i < nr_reqs; i++) {
++			size_t io_size = dev->block_size;
++			size_t buf_off = i * io_size;
++			size_t f_off = off + buf_off;
++
++			fill_buffer_pattern(buf->ptr + buf_off, io_size, f_off);
++			ret = test_passthrough_io(ring, dev, buf, true, f_off,
++						  buf_off, io_size);
++			if (ret) {
++				fprintf(stderr, "test_passthrough_io() write failed\n");
++				return ret;
++			}
++		}
++		off += nr_reqs * dev->block_size;
++	}
++
++	return 0;
++}
++
++/*
++ * A dmabuf backed buffer combined with a passthrough command that also
++ * carries metadata is rejected by the kernel (see nvme_uring_cmd_io()).
++ * metadata_len alone is enough to trigger it - the kernel never reaches a
++ * point where it would need to dereference the metadata pointer.
++ */
++static int test_passthrough_metadata_rejected(struct io_uring *ring,
++					      struct t_dev *dev)
++{
++	struct nvme_uring_cmd *cmd;
++	struct io_uring_cqe *cqe;
++	struct io_uring_sqe *sqe;
++	int ret;
++
++	sqe = io_uring_get_sqe(ring);
++	io_uring_prep_uring_cmd(sqe, NVME_URING_CMD_IO, dev->fd);
++	sqe->buf_index = 0;
++	sqe->uring_cmd_flags |= IORING_URING_CMD_FIXED;
++	sqe->user_data = 43;
++
++	cmd = (struct nvme_uring_cmd *)sqe->cmd;
++	memset(cmd, 0, sizeof(*cmd));
++	cmd->opcode = nvme_cmd_read;
++	cmd->nsid = nsid;
++	cmd->cdw12 = (dev->block_size >> lba_shift) - 1;
++	cmd->addr = 0;
++	cmd->data_len = dev->block_size;
++	cmd->metadata_len = 8;
++
++	ret = io_uring_submit(ring);
++	if (ret <= 0) {
++		fprintf(stderr, "sqe submit failed: %d\n", ret);
++		return -1;
++	}
++	ret = io_uring_wait_cqe(ring, &cqe);
++	if (ret < 0) {
++		fprintf(stderr, "wait completion %d\n", ret);
++		return -1;
++	}
++	if (cqe->res != -EOPNOTSUPP) {
++		fprintf(stderr, "expected -EOPNOTSUPP for dmabuf+metadata, got %i\n",
++			cqe->res);
++		return -1;
++	}
++	io_uring_cqe_seen(ring, cqe);
++
++	return 0;
++}
++
+ static int test_writes(struct io_uring *ring, struct t_dev *dev, struct t_buf *buf)
+ {
+ 	struct io_uring_cqe *cqe;
+@@ -600,6 +787,41 @@ static int test_device(const char *dev_name, bool defer_taskrun)
+ 		return ret;
+ 	}
+ 
++	ret = nvme_get_info(dev_name);
++	if (ret) {
++		fprintf(stderr, "nvme_get_info failed %i, skipping passthrough tests\n",
++			ret);
++		goto out;
++	}
++
++	ret = test_passthrough_reads(&ring, &dev, &dmabuf);
++	if (ret) {
++		fprintf(stderr, "test_passthrough_reads failed %i\n", ret);
++		return ret;
++	}
++
++	ret = test_passthrough_writes(&ring, &dev, &dmabuf);
++	if (ret) {
++		fprintf(stderr, "test_passthrough_writes failed %i\n", ret);
++		return ret;
++	}
++	ret = read_verify(&dev);
++	if (ret)
++		return ret;
++
++	ret = test_passthrough_reads(&ring, &dev, &dmabuf);
++	if (ret) {
++		fprintf(stderr, "test_passthrough_reads #2 failed %i\n", ret);
++		return ret;
++	}
++
++	ret = test_passthrough_metadata_rejected(&ring, &dev);
++	if (ret) {
++		fprintf(stderr, "test_passthrough_metadata_rejected failed %i\n", ret);
++		return ret;
++	}
++
++out:
+ 	io_uring_queue_exit(&ring);
+ 	close_udmabuf(&dmabuf);
+ 	close_device(&dev);
+-- 
+2.43.0
+
