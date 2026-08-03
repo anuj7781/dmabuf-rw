@@ -1,0 +1,321 @@
+From 6d8288866c479b271cc95e7516b2682a8b06eace Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Mon, 3 Aug 2026 16:03:02 +0530
+Subject: [PATCH] tests/rw-dmabuf: use the NVMe char device for passthrough
+
+NVMe uring_cmd passthrough is issued against the generic char device
+(/dev/ngXnY), not the block device - and that char device can't be
+opened O_DIRECT at all (it has no read/write path, so the VFS never
+grants it FMODE_CAN_ODIRECT).
+
+Accept a second device argument for the char device, open it plain
+(no O_DIRECT), and register the same dmabuf against it into its own
+buffer slot (slot 1, alongside the block device's slot 0) - a dmabuf
+ctx is bound to one target file, so passthrough needs its own
+registration against the char device fd rather than reusing the
+block device's. All passthrough test helpers now take that fd
+explicitly and address slot 1 instead of slot 0.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ test/rw-dmabuf.c | 133 ++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 102 insertions(+), 31 deletions(-)
+
+diff --git a/test/rw-dmabuf.c b/test/rw-dmabuf.c
+index 0ad5b68b..518f2eea 100644
+--- a/test/rw-dmabuf.c
++++ b/test/rw-dmabuf.c
+@@ -176,6 +176,31 @@ static void close_device(struct t_dev *dev)
+ 	dev->fd = -1;
+ }
+ 
++/*
++ * The NVMe generic char device (/dev/ngXnY) has no read/write path of its
++ * own, only ioctl/uring_cmd, so it can't be opened O_DIRECT at all (no
++ * a_ops->direct_IO to grant FMODE_CAN_ODIRECT) - open it plain, and use it
++ * only for uring_cmd passthrough.
++ */
++static int open_chr_device(int *fd, const char *dev_name)
++{
++	int f;
++
++	f = open(dev_name, O_RDWR);
++	if (f < 0) {
++		fprintf(stderr, "Can't open char device %i\n", errno);
++		return T_EXIT_SKIP;
++	}
++
++	*fd = f;
++	return 0;
++}
++
++static void close_chr_device(int fd)
++{
++	close(fd);
++}
++
+ static int create_udmabuf(struct t_buf *b, size_t size)
+ {
+ 	struct udmabuf_create create;
+@@ -418,15 +443,18 @@ static int test_read(struct io_uring *ring, struct t_dev *dev, struct t_buf *buf
+ }
+ 
+ /*
+- * NVMe uring_cmd passthrough read/write, using the same dmabuf registered
+- * buffer as the FIXED read/write tests above. Unlike READ_FIXED/WRITE_FIXED,
+- * cqe->res is the raw NVMe completion status (0 == success), not a byte
+- * count, and offsets/sizes must be LBA-aligned since this builds the raw
+- * NVMe command ourselves instead of letting the block layer translate it.
++ * NVMe uring_cmd passthrough read/write, using a dmabuf registered buffer
++ * against chr_fd - the NVMe generic char device (/dev/ngXnY), which is what
++ * passthrough is actually issued against, at buf_index 1 (registered
++ * separately from the block device's slot 0, since a dmabuf ctx is bound to
++ * one target file). Unlike READ_FIXED/WRITE_FIXED, cqe->res is the raw NVMe
++ * completion status (0 == success), not a byte count, and offsets/sizes
++ * must be LBA-aligned since this builds the raw NVMe command ourselves
++ * instead of letting the block layer translate it.
+  */
+ static int test_passthrough_io(struct io_uring *ring, struct t_dev *dev,
+-			       struct t_buf *buf, bool write, size_t f_off,
+-			       size_t buf_off, size_t size)
++			       struct t_buf *buf, int chr_fd, bool write,
++			       size_t f_off, size_t buf_off, size_t size)
+ {
+ 	struct nvme_uring_cmd *cmd;
+ 	struct io_uring_cqe *cqe;
+@@ -441,8 +469,8 @@ static int test_passthrough_io(struct io_uring *ring, struct t_dev *dev,
+ 	nlb = (size >> lba_shift) - 1;
+ 
+ 	sqe = io_uring_get_sqe(ring);
+-	io_uring_prep_uring_cmd(sqe, NVME_URING_CMD_IO, dev->fd);
+-	sqe->buf_index = 0;
++	io_uring_prep_uring_cmd(sqe, NVME_URING_CMD_IO, chr_fd);
++	sqe->buf_index = 1;
+ 	sqe->uring_cmd_flags |= IORING_URING_CMD_FIXED;
+ 	sqe->user_data = 42;
+ 
+@@ -482,14 +510,15 @@ static int test_passthrough_io(struct io_uring *ring, struct t_dev *dev,
+ }
+ 
+ static int test_passthrough_reads(struct io_uring *ring, struct t_dev *dev,
+-				  struct t_buf *buf)
++				  struct t_buf *buf, int chr_fd)
+ {
+ 	size_t f_offs[] = { 0, 1, 2, 7 };
+ 	size_t buf_offs[] = { 0, 1, 2, 7 };
+ 	size_t io_sizes[] = { 1, 2, 3, 15, 7, 16, 32, 31 };
+ 	int ret;
+ 
+-	ret = test_passthrough_io(ring, dev, buf, false, 0, 0, dev->block_size);
++	ret = test_passthrough_io(ring, dev, buf, chr_fd, false, 0, 0,
++				  dev->block_size);
+ 	if (ret) {
+ 		fprintf(stderr, "test_passthrough_io() single read failed\n");
+ 		return ret;
+@@ -504,8 +533,9 @@ static int test_passthrough_reads(struct io_uring *ring, struct t_dev *dev,
+ 
+ 				assert(buf_off + size <= buf->size);
+ 
+-				ret = test_passthrough_io(ring, dev, buf, false,
+-							  f_off, buf_off, size);
++				ret = test_passthrough_io(ring, dev, buf, chr_fd,
++							  false, f_off, buf_off,
++							  size);
+ 				if (ret) {
+ 					fprintf(stderr, "test_passthrough_io() read failed ret=%i, foff=%li, off=%li, io=%li\n",
+ 						ret, (long)f_off, (long)buf_off,
+@@ -520,7 +550,7 @@ static int test_passthrough_reads(struct io_uring *ring, struct t_dev *dev,
+ }
+ 
+ static int test_passthrough_writes(struct io_uring *ring, struct t_dev *dev,
+-				   struct t_buf *buf)
++				   struct t_buf *buf, int chr_fd)
+ {
+ 	const int nr_reqs = 16;
+ 	size_t off = 0;
+@@ -541,8 +571,8 @@ static int test_passthrough_writes(struct io_uring *ring, struct t_dev *dev,
+ 			size_t f_off = off + buf_off;
+ 
+ 			fill_buffer_pattern(buf->ptr + buf_off, io_size, f_off);
+-			ret = test_passthrough_io(ring, dev, buf, true, f_off,
+-						  buf_off, io_size);
++			ret = test_passthrough_io(ring, dev, buf, chr_fd, true,
++						  f_off, buf_off, io_size);
+ 			if (ret) {
+ 				fprintf(stderr, "test_passthrough_io() write failed\n");
+ 				return ret;
+@@ -561,7 +591,7 @@ static int test_passthrough_writes(struct io_uring *ring, struct t_dev *dev,
+  * point where it would need to dereference the metadata pointer.
+  */
+ static int test_passthrough_metadata_rejected(struct io_uring *ring,
+-					      struct t_dev *dev)
++					      struct t_dev *dev, int chr_fd)
+ {
+ 	struct nvme_uring_cmd *cmd;
+ 	struct io_uring_cqe *cqe;
+@@ -569,8 +599,8 @@ static int test_passthrough_metadata_rejected(struct io_uring *ring,
+ 	int ret;
+ 
+ 	sqe = io_uring_get_sqe(ring);
+-	io_uring_prep_uring_cmd(sqe, NVME_URING_CMD_IO, dev->fd);
+-	sqe->buf_index = 0;
++	io_uring_prep_uring_cmd(sqe, NVME_URING_CMD_IO, chr_fd);
++	sqe->buf_index = 1;
+ 	sqe->uring_cmd_flags |= IORING_URING_CMD_FIXED;
+ 	sqe->user_data = 43;
+ 
+@@ -698,7 +728,8 @@ static int test_reads(struct io_uring *ring, struct t_dev *dev, struct t_buf *bu
+ 	return 0;
+ }
+ 
+-static int test_device(const char *dev_name, bool defer_taskrun)
++static int test_device(const char *dev_name, const char *chr_dev_name,
++		       bool defer_taskrun)
+ {
+ 	struct io_uring_rsrc_update2 up;
+ 	struct io_uring_regbuf_desc rd;
+@@ -707,6 +738,7 @@ static int test_device(const char *dev_name, bool defer_taskrun)
+ 	struct t_dev dev;
+ 	struct t_buf dmabuf;
+ 	unsigned flags = 0;
++	int chr_fd = -1;
+ 	int ret;
+ 
+ 	ret = open_device(&dev, dev_name);
+@@ -745,7 +777,8 @@ static int test_device(const char *dev_name, bool defer_taskrun)
+ 		return -1;
+ 	}
+ 
+-	ret = io_uring_register_buffers_sparse(&ring, 1);
++	/* slot 0: dmabuf registered against the block device, for FIXED I/O */
++	ret = io_uring_register_buffers_sparse(&ring, 2);
+ 	if (ret) {
+ 		fprintf(stderr, "sparse buf table reg failed %i\n", ret);
+ 		return ret;
+@@ -754,6 +787,7 @@ static int test_device(const char *dev_name, bool defer_taskrun)
+ 	memset(&up, 0, sizeof(up));
+ 	up.data = uring_ptr_to_u64(&rd);
+ 	up.nr = 1;
++	up.offset = 0;
+ 	up.resv = IORING_RSRC_UPDATE_EXTENDED;
+ 
+ 	memset(&rd, 0, sizeof(rd));
+@@ -787,20 +821,49 @@ static int test_device(const char *dev_name, bool defer_taskrun)
+ 		return ret;
+ 	}
+ 
+-	ret = nvme_get_info(dev_name);
++	/*
++	 * Passthrough is issued against the NVMe generic char device, not
++	 * the block device - open it separately (no O_DIRECT, see
++	 * open_chr_device()) and register the same dmabuf against it into
++	 * its own slot, since a dmabuf ctx is bound to one target file.
++	 */
++	ret = open_chr_device(&chr_fd, chr_dev_name);
+ 	if (ret) {
+-		fprintf(stderr, "nvme_get_info failed %i, skipping passthrough tests\n",
++		fprintf(stderr, "open_chr_device failed %i, skipping passthrough tests\n",
+ 			ret);
+ 		goto out;
+ 	}
+ 
+-	ret = test_passthrough_reads(&ring, &dev, &dmabuf);
++	ret = nvme_get_info(chr_dev_name);
++	if (ret) {
++		fprintf(stderr, "nvme_get_info failed %i, skipping passthrough tests\n",
++			ret);
++		goto out_chr;
++	}
++
++	memset(&up, 0, sizeof(up));
++	up.data = uring_ptr_to_u64(&rd);
++	up.nr = 1;
++	up.offset = 1;
++	up.resv = IORING_RSRC_UPDATE_EXTENDED;
++
++	memset(&rd, 0, sizeof(rd));
++	rd.target_fd = chr_fd;
++	rd.dmabuf_fd = dmabuf.dmabuf_fd;
++	rd.type = IO_REGBUF_TYPE_DMABUF;
++	ret = register_buf(&ring, &up);
++	if (ret) {
++		fprintf(stderr, "passthrough registration failed %i\n", ret);
++		return ret;
++	}
++
++	ret = test_passthrough_reads(&ring, &dev, &dmabuf, chr_fd);
+ 	if (ret) {
+ 		fprintf(stderr, "test_passthrough_reads failed %i\n", ret);
+ 		return ret;
+ 	}
+ 
+-	ret = test_passthrough_writes(&ring, &dev, &dmabuf);
++	ret = test_passthrough_writes(&ring, &dev, &dmabuf, chr_fd);
+ 	if (ret) {
+ 		fprintf(stderr, "test_passthrough_writes failed %i\n", ret);
+ 		return ret;
+@@ -809,18 +872,20 @@ static int test_device(const char *dev_name, bool defer_taskrun)
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = test_passthrough_reads(&ring, &dev, &dmabuf);
++	ret = test_passthrough_reads(&ring, &dev, &dmabuf, chr_fd);
+ 	if (ret) {
+ 		fprintf(stderr, "test_passthrough_reads #2 failed %i\n", ret);
+ 		return ret;
+ 	}
+ 
+-	ret = test_passthrough_metadata_rejected(&ring, &dev);
++	ret = test_passthrough_metadata_rejected(&ring, &dev, chr_fd);
+ 	if (ret) {
+ 		fprintf(stderr, "test_passthrough_metadata_rejected failed %i\n", ret);
+ 		return ret;
+ 	}
+ 
++out_chr:
++	close_chr_device(chr_fd);
+ out:
+ 	io_uring_queue_exit(&ring);
+ 	close_udmabuf(&dmabuf);
+@@ -831,13 +896,19 @@ out:
+ int main(int argc, char *argv[])
+ {
+ 	const char *dev_name = NULL;
++	const char *chr_dev_name = NULL;
+ 	int ret;
+ 
+-	if (argc != 2) {
+-		fprintf(stderr, "Device not provided, skip\n");
++	if (argc != 3) {
++		fprintf(stderr,
++			"Usage: %s <block-device> <char-device>\n"
++			"  block-device: e.g. /dev/nvme0n1, used for READ/WRITE_FIXED\n"
++			"  char-device: e.g. /dev/ng0n1, used for uring_cmd passthrough\n",
++			argv[0]);
+ 		return T_EXIT_SKIP;
+ 	}
+ 	dev_name = argv[1];
++	chr_dev_name = argv[2];
+ 
+ 	page_size = sysconf(_SC_PAGESIZE);
+ 	if (page_size < 0) {
+@@ -851,14 +922,14 @@ int main(int argc, char *argv[])
+ 		return T_EXIT_SKIP;
+ 	}
+ 
+-	ret = test_device(dev_name, false);
++	ret = test_device(dev_name, chr_dev_name, false);
+ 	if (ret) {
+ 		if (ret != T_EXIT_SKIP)
+ 			fprintf(stderr, "test_device() failed\n");
+ 		return ret;
+ 	}
+ 
+-	ret = test_device(dev_name, true);
++	ret = test_device(dev_name, chr_dev_name, true);
+ 	if (ret) {
+ 		if (ret != T_EXIT_SKIP)
+ 			fprintf(stderr, "test_device() DEFER_TASKRUN failed\n");
+-- 
+2.43.0
+
