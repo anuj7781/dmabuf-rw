@@ -1,0 +1,245 @@
+On Tue, Jul 28, 2026 at 10:29:21PM +0100, Pavel Begunkov wrote:
+> From: Anuj Gupta <anuj20.g@samsung.com>
+> 
+> Add SGL support in addition to PRP for dmabuf-backed requests,
+> coalescing the mapping's sg_table into NVMe SGL data descriptors.
+> 
+> Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+> [pavel: rebased]
+> Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+> ---
+>  drivers/nvme/host/pci.c | 191 +++++++++++++++++++++++++++++++++++++++-
+>  1 file changed, 187 insertions(+), 4 deletions(-)
+> 
+> diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+> index f1b67c191892..cbb321fb7c50 100644
+> --- a/drivers/nvme/host/pci.c
+> +++ b/drivers/nvme/host/pci.c
+> @@ -1287,12 +1287,18 @@ static blk_status_t nvme_pci_setup_data_prp(struct request *req,
+>  	return BLK_STS_IOERR;
+>  }
+>  
+> +static void nvme_pci_sgl_set_data_addr(struct nvme_sgl_desc *sge,
+> +				       dma_addr_t addr, u32 len)
+> +{
+> +	sge->addr = cpu_to_le64(addr);
+> +	sge->length = cpu_to_le32(len);
+> +	sge->type = NVME_SGL_FMT_DATA_DESC << 4;
+> +}
+> +
+>  static void nvme_pci_sgl_set_data(struct nvme_sgl_desc *sge,
+>  		struct blk_dma_iter *iter)
+>  {
+> -	sge->addr = cpu_to_le64(iter->addr);
+> -	sge->length = cpu_to_le32(iter->len);
+> -	sge->type = NVME_SGL_FMT_DATA_DESC << 4;
+> +	nvme_pci_sgl_set_data_addr(sge, iter->addr, iter->len);
+>  }
+
+The naming is a bit confusing (and me passing the iter to
+nvme_pci_sgl_set_data is probably at faul for that).  So maybe
+spin out a prep patch to rename the old nvme_pci_sgl_set_data
+to nvme_pci_dma_iter_set_sgl or so, and then add the new one
+as nvme_pci_sgl_set_data (as before the dma_iter conversion).
+
+>
+> +static unsigned int nvme_pci_dmabuf_sgl_nents(struct request *req,
+> +					      dma_addr_t *first_dma,
+> +					      u32 *first_len)
+
+This is a really good example why the aligning to the opening braces
+produces totally unreadble code..
+
+But I also don't understand what the use case for this function
+is to start with.  struct sg_table tells us how many segments
+exist on the DMA side in the nents member, which should be just
+fine for the SGL threshold calculation.
+
+> +{
+> +	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+> +	struct bio *bio = req->bio;
+> +	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
+> +	size_t length = blk_rq_payload_bytes(req);
+> +	struct nvme_sgl_desc *sg_list = NULL;
+> +	dma_addr_t sgl_dma = 0, last_end = 0;
+> +	unsigned int mapped = 0;
+> +	unsigned long tmp;
+> +	struct scatterlist *sg;
+> +	size_t offset, remaining;
+> +	bool have = false;
+> +
+> +	if (!entries)
+> +		return BLK_STS_IOERR;
+> +	if (entries > NVME_MAX_SEGS)
+> +		return BLK_STS_AGAIN;
+
+Given that the block layer enforced data in rw/command and the
+max_segments limit, why do we need the extra check here?
+
+> +			continue;
+> +		}
+> +
+> +		addr += offset;
+> +		sg_len -= offset;
+> +		offset = 0;
+> +
+> +		while (sg_len && remaining) {
+
+These can't be false on the first iteration, so maybe turn this into
+a do {} while loop?
+
+> +			u32 chunk = min_t(size_t, remaining, sg_len);
+> +
+> +			if (have && last_end == addr) {
+> +				u32 old = le32_to_cpu(sg_list[mapped - 1].length);
+> +
+> +				sg_list[mapped - 1].length = cpu_to_le32(old + chunk);
+
+Overly long line.
+
+> +			} else {
+> +				if (WARN_ON_ONCE(mapped == entries))
+> +					goto err_free;
+> +				nvme_pci_sgl_set_data_addr(&sg_list[mapped++],
+> +							   addr, chunk);
+> +			}
+
+Why do we need this merging?  dma_map_sg should have already done
+any interesting merging, or am I missing something?
+
+> +		if (use_sgl != SGL_UNSUPPORTED) {
+> +			dma_addr_t first_dma;
+> +			u32 first_len;
+> +			unsigned int entries;
+> +
+> +			entries = nvme_pci_dmabuf_sgl_nents(req, &first_dma,
+> +							    &first_len);
+> +
+> +			if (use_sgl == SGL_FORCED) {
+> +				ret = nvme_rq_setup_dmabuf_sgl(req, nvmeq,
+> +								entries, first_dma, first_len);
+> +				return ret == BLK_STS_AGAIN ? BLK_STS_IOERR : ret;
+> +			}
+> +
+> +			if (sgl_threshold && entries &&
+> +			    DIV_ROUND_UP(blk_rq_payload_bytes(req), entries) >=
+> +			    sgl_threshold) {
+> +				ret = nvme_rq_setup_dmabuf_sgl(req, nvmeq,
+> +								entries, first_dma, first_len);
+> +				if (ret != BLK_STS_AGAIN)
+> +					return ret;
+> +			}
+> +		}
+
+Various overly long lines.  Please factor out a helper for the
+decisions to use sgl vs not instead of open coding it here.
+
+
+Anuj reply
+>> +static void nvme_pci_sgl_set_data_addr(struct nvme_sgl_desc *sge,
+>> +				       dma_addr_t addr, u32 len)
+>> +{
+>> +	sge->addr = cpu_to_le64(addr);
+>> +	sge->length = cpu_to_le32(len);
+>> +	sge->type = NVME_SGL_FMT_DATA_DESC << 4;
+>> +}
+>> +
+>>   static void nvme_pci_sgl_set_data(struct nvme_sgl_desc *sge,
+>>   		struct blk_dma_iter *iter)
+>>   {
+>> -	sge->addr = cpu_to_le64(iter->addr);
+>> -	sge->length = cpu_to_le32(iter->len);
+>> -	sge->type = NVME_SGL_FMT_DATA_DESC << 4;
+>> +	nvme_pci_sgl_set_data_addr(sge, iter->addr, iter->len);
+>>   }
+> 
+> The naming is a bit confusing (and me passing the iter to
+> nvme_pci_sgl_set_data is probably at faul for that).  So maybe
+> spin out a prep patch to rename the old nvme_pci_sgl_set_data
+> to nvme_pci_dma_iter_set_sgl or so, and then add the new one
+> as nvme_pci_sgl_set_data (as before the dma_iter conversion).
+>
+
+Thanks for the detailed review! Will split the rename into a prep patch.
+
+>>
+>> +static unsigned int nvme_pci_dmabuf_sgl_nents(struct request *req,
+>> +					      dma_addr_t *first_dma,
+>> +					      u32 *first_len)
+> 
+> This is a really good example why the aligning to the opening braces
+> produces totally unreadble code..
+> 
+> But I also don't understand what the use case for this function
+> is to start with.  struct sg_table tells us how many segments
+> exist on the DMA side in the nents member, which should be just
+> fine for the SGL threshold calculation.
+
+sg_table->nents covers the entire exported buffer (<=1GiB), while a
+request only covers a subrange[bi_offset, bi_offset+payload). Using
+nents would overcount the request's segments.
+
+> 
+>> +{
+>> +	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+>> +	struct bio *bio = req->bio;
+>> +	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
+>> +	size_t length = blk_rq_payload_bytes(req);
+>> +	struct nvme_sgl_desc *sg_list = NULL;
+>> +	dma_addr_t sgl_dma = 0, last_end = 0;
+>> +	unsigned int mapped = 0;
+>> +	unsigned long tmp;
+>> +	struct scatterlist *sg;
+>> +	size_t offset, remaining;
+>> +	bool have = false;
+>> +
+>> +	if (!entries)
+>> +		return BLK_STS_IOERR;
+>> +	if (entries > NVME_MAX_SEGS)
+>> +		return BLK_STS_AGAIN;
+> 
+> Given that the block layer enforced data in rw/command and the
+> max_segments limit, why do we need the extra check here?
+
+A dmabuf bio reports nsegs=1 (bio_split_io_at) to the block layer, so 
+max_segments isn't enforced against the SG entries actually spanned by 
+the request. Hence the explicit check.
+
+> 
+>> +			continue;
+>> +		}
+>> +
+>> +		addr += offset;
+>> +		sg_len -= offset;
+>> +		offset = 0;
+>> +
+>> +		while (sg_len && remaining) {
+> 
+> These can't be false on the first iteration, so maybe turn this into
+> a do {} while loop?
+
+Will do.
+
+> 
+>> +			u32 chunk = min_t(size_t, remaining, sg_len);
+>> +
+>> +			if (have && last_end == addr) {
+>> +				u32 old = le32_to_cpu(sg_list[mapped - 1].length);
+>> +
+>> +				sg_list[mapped - 1].length = cpu_to_le32(old + chunk);
+> 
+> Overly long line.
+> 
+>> +			} else {
+>> +				if (WARN_ON_ONCE(mapped == entries))
+>> +					goto err_free;
+>> +				nvme_pci_sgl_set_data_addr(&sg_list[mapped++],
+>> +							   addr, chunk);
+>> +			}
+> 
+> Why do we need this merging?  dma_map_sg should have already done
+> any interesting merging, or am I missing something?
+
+Will drop it.
+
+

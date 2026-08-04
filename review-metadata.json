@@ -1,0 +1,8 @@
+{
+  "author": "Anuj Gupta <anuj20.g@samsung.com>",
+  "sha": "5fe6c52218f8079f0a7abe2c3e2d03038792b4d2",
+  "subject": "nvme-pci: add SGL support for the dmabuf path",
+  "issues-found": 2,
+  "issue-severity-score": "high",
+  "issue-severity-explanation": "Without an actual DMA-BUF segment-limit check, fragmented requests can overrun the one-page SGL pool; request-relative counting also causes large repeated SG-table prefix scans."
+}

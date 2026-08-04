@@ -1,0 +1,56 @@
+commit 5fe6c52218f8079f0a7abe2c3e2d03038792b4d2
+Author: Anuj Gupta <anuj20.g@samsung.com>
+
+nvme-pci: add SGL support for the dmabuf path
+
+This commit adds SGL support for DMA-BUF-backed NVMe requests and uses a
+single fill loop for both inline and pooled descriptors.
+
+> diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+> index f1b67c191892..3ae261a8d0cb 100644
+> --- a/drivers/nvme/host/pci.c
+> +++ b/drivers/nvme/host/pci.c
+
+[ ... ]
+
+> +static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
+> +		struct nvme_queue *nvmeq, unsigned int entries)
+> +{
+[ ... ]
+> +	bool pooled = entries > 1;
+[ ... ]
+> +	if (pooled) {
+[ ... ]
+> +		sg_list = dma_pool_alloc(nvme_dma_pool(nvmeq, iod), GFP_ATOMIC,
+> +					 &sgl_dma);
+[ ... ]
+> +	}
+
+Could this retain a check that limits entries to NVME_MAX_SEGS before this
+allocation?  The block layer still reports a DMA-BUF bio as one segment in
+bio_split_io_at(), so a fragmented request can produce entries greater than
+the one-page descriptor capacity.  With 257 mapped entries, the fill loop
+writes sg_list[256] past the 4096-byte pool object before the equality check
+can reject it.
+
+[ ... ]
+
+> +static blk_status_t nvme_rq_setup_dmabuf(struct request *req,
+> +		struct nvme_queue *nvmeq, enum nvme_use_sgl use_sgl)
+> +{
+[ ... ]
+> +	if (use_sgl == SGL_UNSUPPORTED)
+> +		return nvme_rq_setup_dmabuf_map(req, nvmeq);
+> +
+> +	entries = nvme_pci_dmabuf_sgl_nents(req);
+[ ... ]
+> +	avg_seg = entries ?
+> +		DIV_ROUND_UP(blk_rq_payload_bytes(req), entries) : 0;
+
+Could the request avoid nvme_pci_dmabuf_sgl_nents() when the payload is
+already below sgl_threshold, or use an indexed request-relative lookup?
+That helper always starts at map->sgt->sgl and consumes bi_offset.  A 4 KiB
+request near the end of a 1 GiB page-granular mapping therefore scans about
+262,000 entries and then selects the PRP path with the default 32 KiB
+threshold; sequential small I/O makes this repeated prefix scan quadratic.
+
