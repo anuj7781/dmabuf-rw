@@ -4,36 +4,17 @@ Date: Thu, 6 Aug 2026 10:51:48 +0530
 Subject: [PATCH] nvme-multipath: support dma-buf passthrough I/O
 
 ---
- drivers/nvme/host/ioctl.c     | 15 ++++++++++++++-
+ drivers/nvme/host/ioctl.c     | 11 ++++++++++-
  drivers/nvme/host/multipath.c | 27 ++++++++++++++++++++++-----
  drivers/nvme/host/nvme.h      |  5 +++++
  include/linux/io_uring/cmd.h  | 10 ++++++++++
  io_uring/rsrc.c               | 23 +++++++++++++++++++++++
- io_uring/uring_cmd.c          |  3 ++-
- 6 files changed, 76 insertions(+), 7 deletions(-)
+ 5 files changed, 72 insertions(+), 3 deletions(-)
 
 diff --git a/drivers/nvme/host/ioctl.c b/drivers/nvme/host/ioctl.c
 index 664216eece4a..7a8803bc1a6f 100644
 --- a/drivers/nvme/host/ioctl.c
 +++ b/drivers/nvme/host/ioctl.c
-@@ -7,6 +7,7 @@
- #include <linux/ptrace.h>	/* for force_successful_syscall_return */
- #include <linux/nvme_ioctl.h>
- #include <linux/io_uring/cmd.h>
-+#include <linux/uio.h>
- #include "nvme.h"
- 
- enum {
-@@ -501,6 +502,9 @@ static int nvme_uring_cmd_io(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
- 		if (ret < 0)
- 			return ret;
- 
-+		if (unlikely(iov_iter_is_dmabuf_map(&iter) && d.metadata_len))
-+			return -EOPNOTSUPP;
-+
- 		map_iter = &iter;
- 	}
- 
 @@ -770,9 +774,18 @@ int nvme_ns_head_chr_uring_cmd(struct io_uring_cmd *ioucmd,
  	struct cdev *cdev = file_inode(ioucmd->file)->i_cdev;
  	struct nvme_ns_head *head = container_of(cdev, struct nvme_ns_head, cdev);
@@ -213,20 +194,5 @@ index 5074b1e4b050..a15b0ea12990 100644
  static void io_release_reg_dmabuf(void *priv)
  {
  	struct io_regbuf_dma *db = priv;
-diff --git a/io_uring/uring_cmd.c b/io_uring/uring_cmd.c
-index 37f24008ef13..025422fe435b 100644
---- a/io_uring/uring_cmd.c
-+++ b/io_uring/uring_cmd.c
-@@ -300,7 +300,8 @@ int io_uring_cmd_import_fixed(u64 ubuf, unsigned long len, int rw,
- 	if (WARN_ON_ONCE(!(ioucmd->flags & IORING_URING_CMD_FIXED)))
- 		return -EINVAL;
- 
--	return io_import_reg_buf(req, iter, ubuf, len, rw, issue_flags);
-+	return __io_import_reg_buf(req, iter, ubuf, len, rw, issue_flags,
-+				   IO_REGBUF_IMPORT_ALLOW_DMABUF);
- }
- EXPORT_SYMBOL_GPL(io_uring_cmd_import_fixed);
- 
 -- 
 2.43.0
-
