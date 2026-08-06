@@ -1,0 +1,232 @@
+From 6d95a426645e745f837a8cc462d631df27bc5b10 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj1072538@gmail.com>
+Date: Thu, 6 Aug 2026 10:51:48 +0530
+Subject: [PATCH] nvme-multipath: support dma-buf passthrough I/O
+
+---
+ drivers/nvme/host/ioctl.c     | 15 ++++++++++++++-
+ drivers/nvme/host/multipath.c | 27 ++++++++++++++++++++++-----
+ drivers/nvme/host/nvme.h      |  5 +++++
+ include/linux/io_uring/cmd.h  | 10 ++++++++++
+ io_uring/rsrc.c               | 23 +++++++++++++++++++++++
+ io_uring/uring_cmd.c          |  3 ++-
+ 6 files changed, 76 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/nvme/host/ioctl.c b/drivers/nvme/host/ioctl.c
+index 664216eece4a..7a8803bc1a6f 100644
+--- a/drivers/nvme/host/ioctl.c
++++ b/drivers/nvme/host/ioctl.c
+@@ -7,6 +7,7 @@
+ #include <linux/ptrace.h>	/* for force_successful_syscall_return */
+ #include <linux/nvme_ioctl.h>
+ #include <linux/io_uring/cmd.h>
++#include <linux/uio.h>
+ #include "nvme.h"
+ 
+ enum {
+@@ -501,6 +502,9 @@ static int nvme_uring_cmd_io(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
+ 		if (ret < 0)
+ 			return ret;
+ 
++		if (unlikely(iov_iter_is_dmabuf_map(&iter) && d.metadata_len))
++			return -EOPNOTSUPP;
++
+ 		map_iter = &iter;
+ 	}
+ 
+@@ -770,9 +774,18 @@ int nvme_ns_head_chr_uring_cmd(struct io_uring_cmd *ioucmd,
+ 	struct cdev *cdev = file_inode(ioucmd->file)->i_cdev;
+ 	struct nvme_ns_head *head = container_of(cdev, struct nvme_ns_head, cdev);
+ 	int srcu_idx = srcu_read_lock(&head->srcu);
+-	struct nvme_ns *ns = nvme_find_path(head);
++	struct dma_buf_io_ctx *ctx = NULL;
++	struct nvme_ns *ns;
+ 	int ret = -EINVAL;
+ 
++	if (ioucmd->cmd_op != NVME_URING_CMD_IO_VEC)
++		ctx = io_uring_cmd_peek_dmabuf_ctx(ioucmd, issue_flags);
++	if (ctx)
++		ns = nvme_ns_head_find_pinned_path(head,
++				nvme_dmabuf_pinned_ctrl(ctx));
++	else
++		ns = nvme_find_path(head);
++
+ 	if (ns)
+ 		ret = nvme_ns_uring_cmd(ns, ioucmd, issue_flags);
+ 	srcu_read_unlock(&head->srcu, srcu_idx);
+diff --git a/drivers/nvme/host/multipath.c b/drivers/nvme/host/multipath.c
+index 90b36977442f..6e22bb44097e 100644
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@ -6,6 +6,7 @@
+ #include <linux/backing-dev.h>
+ #include <linux/moduleparam.h>
+ #include <linux/vmalloc.h>
++#include <linux/io_uring/cmd.h>
+ #include <trace/events/block.h>
+ #include "nvme.h"
+ 
+@@ -512,7 +513,7 @@ static bool nvme_available_path(struct nvme_ns_head *head)
+  * already covers all of that, reuse it rather than reimplementing. Must be
+  * called with head->srcu held.
+  */
+-static struct nvme_ns *nvme_ns_head_find_pinned_path(struct nvme_ns_head *head,
++struct nvme_ns *nvme_ns_head_find_pinned_path(struct nvme_ns_head *head,
+ 						      struct nvme_ctrl *pinned_ctrl)
+ {
+ 	struct nvme_ns *ns;
+@@ -640,10 +641,9 @@ static int nvme_ns_head_report_zones(struct gendisk *disk, sector_t sector,
+  * against this registration fails; there is no automatic re-pin - userspace
+  * must unregister and re-register to pick up a different active path.
+  */
+-static int nvme_ns_head_init_dma_buf_io_ctx(struct block_device *bdev,
+-					     struct dma_buf_io_ctx *ctx)
++static int nvme_ns_head_init_dma_buf_io_ctx(struct nvme_ns_head *head,
++						     struct dma_buf_io_ctx *ctx)
+ {
+-	struct nvme_ns_head *head = bdev->bd_disk->private_data;
+ 	int srcu_idx = srcu_read_lock(&head->srcu);
+ 	struct nvme_ns *ns = nvme_find_path(head);
+ 	int ret = -ENODEV;
+@@ -660,6 +660,22 @@ static int nvme_ns_head_init_dma_buf_io_ctx(struct block_device *bdev,
+ 	return ret;
+ }
+ 
++static int nvme_ns_head_bdev_init_dma_buf_io_ctx(struct block_device *bdev,
++							 struct dma_buf_io_ctx *ctx)
++{
++	return nvme_ns_head_init_dma_buf_io_ctx(bdev->bd_disk->private_data,
++							ctx);
++}
++
++static int nvme_ns_head_chr_init_dma_buf_io_ctx(struct file *file,
++							struct dma_buf_io_ctx *ctx)
++{
++	struct nvme_ns_head *head = container_of(file_inode(file)->i_cdev,
++								struct nvme_ns_head, cdev);
++
++	return nvme_ns_head_init_dma_buf_io_ctx(head, ctx);
++}
++
+ const struct block_device_operations nvme_ns_head_ops = {
+ 	.owner		= THIS_MODULE,
+ 	.submit_bio	= nvme_ns_head_submit_bio,
+@@ -671,7 +687,7 @@ const struct block_device_operations nvme_ns_head_ops = {
+ 	.get_unique_id	= nvme_ns_head_get_unique_id,
+ 	.report_zones	= nvme_ns_head_report_zones,
+ 	.pr_ops		= &nvme_pr_ops,
+-	.init_dma_buf_io_ctx = nvme_ns_head_init_dma_buf_io_ctx,
++	.init_dma_buf_io_ctx = nvme_ns_head_bdev_init_dma_buf_io_ctx,
+ };
+ 
+ static inline struct nvme_ns_head *cdev_to_ns_head(struct cdev *cdev)
+@@ -700,6 +716,7 @@ static const struct file_operations nvme_ns_head_chr_fops = {
+ 	.compat_ioctl	= compat_ptr_ioctl,
+ 	.uring_cmd	= nvme_ns_head_chr_uring_cmd,
+ 	.uring_cmd_iopoll = nvme_ns_chr_uring_cmd_iopoll,
++	.init_dma_buf_io_ctx = nvme_ns_head_chr_init_dma_buf_io_ctx,
+ };
+ 
+ static void nvme_add_ns_head_cdev(struct nvme_ns_head *head)
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 112e82cb0cc9..7d2e95ee1397 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -854,6 +854,11 @@ static inline struct nvme_ctrl *nvme_dmabuf_pinned_ctrl(struct dma_buf_io_ctx *c
+ 	return ((struct nvme_dmabuf_attach *)ctx->dev_priv)->pinned_ctrl;
+ }
+ 
++#ifdef CONFIG_NVME_MULTIPATH
++struct nvme_ns *nvme_ns_head_find_pinned_path(struct nvme_ns_head *head,
++						      struct nvme_ctrl *pinned_ctrl);
++#endif
++
+ static inline bool nvme_is_aen_req(u16 qid, __u16 command_id)
+ {
+ 	return !qid &&
+diff --git a/include/linux/io_uring/cmd.h b/include/linux/io_uring/cmd.h
+index 331dcbefe72f..18af6d04cdc0 100644
+--- a/include/linux/io_uring/cmd.h
++++ b/include/linux/io_uring/cmd.h
+@@ -32,6 +32,8 @@ struct io_uring_cmd {
+ 	(const type *)(sqe)->cmd;						\
+ })
+ 
++struct dma_buf_io_ctx;
++
+ static inline void io_uring_cmd_private_sz_check(size_t cmd_sz)
+ {
+ 	BUILD_BUG_ON(cmd_sz > sizeof_field(struct io_uring_cmd, pdu));
+@@ -42,6 +44,8 @@ static inline void io_uring_cmd_private_sz_check(size_t cmd_sz)
+ )
+ 
+ #if defined(CONFIG_IO_URING)
++struct dma_buf_io_ctx *io_uring_cmd_peek_dmabuf_ctx(
++		struct io_uring_cmd *ioucmd, unsigned int issue_flags);
+ int io_uring_cmd_import_fixed(u64 ubuf, unsigned long len, int rw,
+ 			      struct iov_iter *iter,
+ 			      struct io_uring_cmd *ioucmd,
+@@ -92,6 +96,12 @@ bool io_uring_mshot_cmd_post_cqe(struct io_uring_cmd *ioucmd,
+ 				 struct io_br_sel *sel, unsigned int issue_flags);
+ 
+ #else
++static inline struct dma_buf_io_ctx *
++io_uring_cmd_peek_dmabuf_ctx(struct io_uring_cmd *ioucmd,
++				     unsigned int issue_flags)
++{
++	return NULL;
++}
+ static inline int
+ io_uring_cmd_import_fixed(u64 ubuf, unsigned long len, int rw,
+ 			  struct iov_iter *iter, struct io_uring_cmd *ioucmd,
+diff --git a/io_uring/rsrc.c b/io_uring/rsrc.c
+index 5074b1e4b050..a15b0ea12990 100644
+--- a/io_uring/rsrc.c
++++ b/io_uring/rsrc.c
+@@ -887,6 +887,29 @@ struct io_regbuf_dma {
+ 	struct file			*target_file;
+ };
+ 
++struct dma_buf_io_ctx *io_uring_cmd_peek_dmabuf_ctx(
++		struct io_uring_cmd *ioucmd, unsigned int issue_flags)
++{
++	struct io_kiocb *req = cmd_to_io_kiocb(ioucmd);
++	struct io_rsrc_node *node;
++	struct io_mapped_ubuf *imu;
++	struct io_regbuf_dma *db;
++
++	if (!(ioucmd->flags & IORING_URING_CMD_FIXED))
++		return NULL;
++
++	node = io_find_buf_node(req, issue_flags);
++	if (!node)
++		return NULL;
++	imu = node->buf;
++	if (!(imu->flags & IO_REGBUF_F_DMABUF))
++		return NULL;
++
++	db = imu->priv;
++	return &db->ctx;
++}
++EXPORT_SYMBOL_GPL(io_uring_cmd_peek_dmabuf_ctx);
++
+ static void io_release_reg_dmabuf(void *priv)
+ {
+ 	struct io_regbuf_dma *db = priv;
+diff --git a/io_uring/uring_cmd.c b/io_uring/uring_cmd.c
+index 37f24008ef13..025422fe435b 100644
+--- a/io_uring/uring_cmd.c
++++ b/io_uring/uring_cmd.c
+@@ -300,7 +300,8 @@ int io_uring_cmd_import_fixed(u64 ubuf, unsigned long len, int rw,
+ 	if (WARN_ON_ONCE(!(ioucmd->flags & IORING_URING_CMD_FIXED)))
+ 		return -EINVAL;
+ 
+-	return io_import_reg_buf(req, iter, ubuf, len, rw, issue_flags);
++	return __io_import_reg_buf(req, iter, ubuf, len, rw, issue_flags,
++				   IO_REGBUF_IMPORT_ALLOW_DMABUF);
+ }
+ EXPORT_SYMBOL_GPL(io_uring_cmd_import_fixed);
+ 
+-- 
+2.43.0
+
