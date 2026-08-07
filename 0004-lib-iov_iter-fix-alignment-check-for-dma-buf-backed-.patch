@@ -1,0 +1,38 @@
+From ac5d41051efcf33b031690756d0a74a8f31c4a3d Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Fri, 7 Aug 2026 15:32:28 +0530
+Subject: [PATCH 1/2] lib/iov_iter: fix alignment check for dma-buf backed
+ iterators
+
+iov_iter_alignment() folded dma-buf iters into the ubuf branch, which
+reads i->ubuf - but ubuf/bvec/dmabuf_map are the same union member, so
+this reinterprets the dma_buf_io_map pointer as a user address.
+iov_iter_gap_alignment() already handles dma-buf correctly (returns 0
+without touching i->ubuf); do the same here. Currently dead code in
+the posted dmabuf-rw series, but live as soon as a dma-buf iter reaches
+blk_rq_map_user_iov() or bio_integrity_map_user(), i.e. passthrough.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ lib/iov_iter.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/lib/iov_iter.c b/lib/iov_iter.c
+index d6f5d7e180b5..8bf2ad2db1be 100644
+--- a/lib/iov_iter.c
++++ b/lib/iov_iter.c
+@@ -857,7 +857,10 @@ static unsigned long iov_iter_alignment_bvec(const struct iov_iter *i)
+ 
+ unsigned long iov_iter_alignment(const struct iov_iter *i)
+ {
+-	if (likely(iter_is_ubuf(i)) || iov_iter_is_dmabuf_map(i)) {
++	if (iov_iter_is_dmabuf_map(i))
++		return 0;
++
++	if (likely(iter_is_ubuf(i))) {
+ 		size_t size = i->count;
+ 		if (size)
+ 			return ((unsigned long)i->ubuf + i->iov_offset) | size;
+-- 
+2.43.0
+
