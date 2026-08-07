@@ -1,0 +1,511 @@
+From c6022e493cfffb022da16790b6e0fccab5059500 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Fri, 7 Aug 2026 12:42:16 +0530
+Subject: [PATCH] io_uring: add vectored DMA-BUF block I/O
+
+Extend ITER_DMABUF_MAP with a vector form so fixed READV and WRITEV
+requests can describe multiple ranges within one registered dma-buf.
+Import and validate the ranges in io_uring, retain one map reference
+per request, and release the request-owned range storage with the
+existing async read/write lifecycle.
+
+Teach the block direct-I/O path to build one bio per range and
+continue submitting bios until all ranges are consumed. Keep
+queue-limit splitting and the NVMe PRP, SGL, and multipath paths
+unchanged, and leave NVMe passthrough vectored dma-buf imports
+disabled to preserve pinned-path routing.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ block/bio.c                |  14 ++++-
+ block/fops.c               |   6 +-
+ include/linux/dma-buf-io.h |   6 ++
+ include/linux/uio.h        |  11 ++++
+ io_uring/rsrc.c            | 116 ++++++++++++++++++++++++++++++++-----
+ io_uring/rsrc.h            |   1 +
+ io_uring/rw.c              |  11 +++-
+ io_uring/rw.h              |   2 +
+ lib/iov_iter.c             |  60 +++++++++++++++++--
+ 9 files changed, 202 insertions(+), 25 deletions(-)
+
+diff --git a/block/bio.c b/block/bio.c
+index 1602eab05761..ecb53bf8ea45 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -7,6 +7,7 @@
+ #include <linux/bio-integrity.h>
+ #include <linux/blkdev.h>
+ #include <linux/uio.h>
++#include <linux/dma-buf-io.h>
+ #include <linux/iocontext.h>
+ #include <linux/slab.h>
+ #include <linux/init.h>
+@@ -1199,8 +1200,17 @@ bool bio_iov_iter_set(struct bio *bio, const struct iov_iter *iter)
+ 
+ 	bio->bi_io_vec = (struct bio_vec *)iter->bvec;
+ 	bio->bi_iter.bi_idx = 0;
+-	bio->bi_iter.bi_offset = iter->iov_offset;
+-	bio->bi_iter.bi_size = iov_iter_count(iter);
++	if (iov_iter_is_dmabuf_vec(iter)) {
++		const struct dma_buf_io_vec *vec = iter->dmabuf_vec;
++
++		bio->bi_dmabuf_map = vec->map;
++		bio->bi_iter.bi_offset = vec->offset + iter->iov_offset;
++		bio->bi_iter.bi_size = min_t(size_t, iov_iter_count(iter),
++					     vec->len - iter->iov_offset);
++	} else {
++		bio->bi_iter.bi_offset = iter->iov_offset;
++		bio->bi_iter.bi_size = iov_iter_count(iter);
++	}
+ 	bio_set_flag(bio, BIO_CLONED);
+ 	if (iov_iter_is_dmabuf_map(iter))
+ 		bio->bi_opf |= REQ_NOMERGE | REQ_DMABUF;
+diff --git a/block/fops.c b/block/fops.c
+index 3c403afb0f64..d427f029c9f9 100644
+--- a/block/fops.c
++++ b/block/fops.c
+@@ -254,7 +254,8 @@ static ssize_t __blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
+ 		pos += bio->bi_iter.bi_size;
+ 
+ 		nr_pages = bio_iov_vecs_to_alloc(iter, BIO_MAX_VECS);
+-		if (!nr_pages) {
++		if (!nr_pages &&
++		    (!iov_iter_is_dmabuf_vec(iter) || !iov_iter_count(iter))) {
+ 			submit_bio(bio);
+ 			break;
+ 		}
+@@ -424,7 +425,8 @@ static ssize_t blkdev_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
+ 
+ 	nr_pages = bio_iov_vecs_to_alloc(iter, BIO_MAX_VECS + 1);
+ 	if (likely(nr_pages <= BIO_MAX_VECS &&
+-		   !(iocb->ki_flags & IOCB_HAS_METADATA))) {
++		   !(iocb->ki_flags & IOCB_HAS_METADATA) &&
++		   !iov_iter_is_dmabuf_vec(iter))) {
+ 		if (is_sync_kiocb(iocb))
+ 			return __blkdev_direct_IO_simple(iocb, iter, bdev,
+ 							nr_pages);
+diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
+index f31c7375ae91..7701de41ad87 100644
+--- a/include/linux/dma-buf-io.h
++++ b/include/linux/dma-buf-io.h
+@@ -8,6 +8,12 @@ struct dma_buf_io_fence;
+ struct dma_buf_io_ctx;
+ struct dma_buf_io_map;
+ 
++struct dma_buf_io_vec {
++	struct dma_buf_io_map	*map;
++	loff_t			offset;
++	size_t			len;
++};
++
+ struct dma_buf_io_ops {
+ 	/*
+ 	 * Create a new map for the given ctx. Called with the reservation
+diff --git a/include/linux/uio.h b/include/linux/uio.h
+index 638c1116e912..7b930846e062 100644
+--- a/include/linux/uio.h
++++ b/include/linux/uio.h
+@@ -13,6 +13,7 @@
+ struct page;
+ struct folio_queue;
+ struct dma_buf_io_map;
++struct dma_buf_io_vec;
+ 
+ typedef unsigned int __bitwise iov_iter_extraction_t;
+ 
+@@ -46,6 +47,7 @@ struct iov_iter {
+ 	u8 iter_type;
+ 	bool nofault;
+ 	bool data_source;
++	bool is_dmabuf_vec;
+ 	size_t iov_offset;
+ 	/*
+ 	 * Hack alert: overlay ubuf_iovec with iovec + count, so
+@@ -74,6 +76,7 @@ struct iov_iter {
+ 				struct xarray *xarray;
+ 				void __user *ubuf;
+ 				struct dma_buf_io_map *dmabuf_map;
++				const struct dma_buf_io_vec *dmabuf_vec;
+ 			};
+ 			size_t count;
+ 		};
+@@ -163,6 +166,11 @@ static inline bool iov_iter_is_dmabuf_map(const struct iov_iter *i)
+ 	return iov_iter_type(i) == ITER_DMABUF_MAP;
+ }
+ 
++static inline bool iov_iter_is_dmabuf_vec(const struct iov_iter *i)
++{
++	return iov_iter_is_dmabuf_map(i) && i->is_dmabuf_vec;
++}
++
+ static inline unsigned char iov_iter_rw(const struct iov_iter *i)
+ {
+ 	return i->data_source ? WRITE : READ;
+@@ -311,6 +319,9 @@ void iov_iter_xarray(struct iov_iter *i, unsigned int direction, struct xarray *
+ void iov_iter_dmabuf_map(struct iov_iter *i, unsigned int direction,
+ 			struct dma_buf_io_map *map,
+ 			loff_t off, size_t count);
++void iov_iter_dmabuf_map_vec(struct iov_iter *i, unsigned int direction,
++			const struct dma_buf_io_vec *vec, unsigned int nr_vecs,
++			size_t count);
+ ssize_t iov_iter_get_pages2(struct iov_iter *i, struct page **pages,
+ 			size_t maxsize, unsigned maxpages, size_t *start);
+ ssize_t iov_iter_get_pages_alloc2(struct iov_iter *i, struct page ***pages,
+diff --git a/io_uring/rsrc.c b/io_uring/rsrc.c
+index a15b0ea12990..1d8a92698489 100644
+--- a/io_uring/rsrc.c
++++ b/io_uring/rsrc.c
+@@ -18,6 +18,7 @@
+ #include "io_uring.h"
+ #include "openclose.h"
+ #include "rsrc.h"
++#include "rw.h"
+ #include "memmap.h"
+ #include "register.h"
+ 
+@@ -1319,24 +1320,108 @@ static int io_import_dmabuf(struct io_kiocb *req,
+ 	if (req->file != db->target_file)
+ 		return -EBADF;
+ 
+-	if (req->flags & REQ_F_DROP_DMABUF) {
++	if (req->flags & REQ_F_DROP_DMABUF)
+ 		map = req->dmabuf_map;
+-		goto init_iter;
++	else {
++		map = dma_buf_io_get_map(&db->ctx);
++		if (unlikely(!map)) {
++			if (!(issue_flags & IO_URING_F_IOWQ))
++				return -EAGAIN;
++			map = dma_buf_io_create_map(&db->ctx);
++			if (IS_ERR(map))
++				return PTR_ERR(map);
++		}
++		req->dmabuf_map = map;
++		req->flags |= REQ_F_DROP_DMABUF;
+ 	}
++	iov_iter_dmabuf_map(iter, ddir, map, offset, len);
++	return 0;
++}
++
++static int io_dmabuf_vec_size(struct iovec *iov, unsigned int nr_iovs,
++				      struct io_regbuf_dma *db, size_t *total_len)
++{
++	unsigned int i;
++
++	*total_len = 0;
++	for (i = 0; i < nr_iovs; i++) {
++		u64 offset = (u64)(uintptr_t)iov[i].iov_base;
++		size_t len = iov[i].iov_len;
+ 
+-	map = dma_buf_io_get_map(&db->ctx);
+-	if (unlikely(!map)) {
+-		if (!(issue_flags & IO_URING_F_IOWQ))
+-			return -EAGAIN;
+-		map = dma_buf_io_create_map(&db->ctx);
+-		if (IS_ERR(map))
+-			return PTR_ERR(map);
++		if (unlikely(!len))
++			return -EFAULT;
++		if (offset > db->ctx.dmabuf->size ||
++		    len > db->ctx.dmabuf->size - offset)
++			return -EFAULT;
++		if (check_add_overflow(*total_len, len, total_len))
++			return -EOVERFLOW;
+ 	}
++	if (*total_len > MAX_RW_COUNT)
++		return -EINVAL;
++	return 0;
++}
+ 
+-	req->dmabuf_map = map;
+-	req->flags |= REQ_F_DROP_DMABUF;
+-init_iter:
+-	iov_iter_dmabuf_map(iter, ddir, map, offset, len);
++static int io_import_dmabuf_vec(struct io_kiocb *req,
++				int ddir, struct iov_iter *iter,
++				struct io_mapped_ubuf *imu,
++				struct iovec *iov, unsigned int nr_iovs,
++				unsigned int issue_flags)
++{
++	struct io_async_rw *io = req->async_data;
++	struct io_regbuf_dma *db = imu->priv;
++	struct dma_buf_io_map *map;
++	struct dma_buf_io_vec *vec;
++	size_t total_len;
++	unsigned int i;
++	bool new_map = !(req->flags & REQ_F_DROP_DMABUF);
++	int ret;
++
++	ret = io_dmabuf_vec_size(iov, nr_iovs, db, &total_len);
++	if (ret)
++		return ret;
++	if (req->file != db->target_file)
++		return -EBADF;
++	if (!nr_iovs) {
++		iov_iter_bvec(iter, ddir, NULL, 0, 0);
++		return 0;
++	}
++
++	if (new_map) {
++		map = dma_buf_io_get_map(&db->ctx);
++		if (unlikely(!map)) {
++			if (!(issue_flags & IO_URING_F_IOWQ))
++				return -EAGAIN;
++			map = dma_buf_io_create_map(&db->ctx);
++			if (IS_ERR(map))
++				return PTR_ERR(map);
++		}
++		req->dmabuf_map = map;
++		req->flags |= REQ_F_DROP_DMABUF;
++	} else {
++		map = req->dmabuf_map;
++	}
++
++	vec = kcalloc(nr_iovs, sizeof(*vec), GFP_KERNEL);
++	if (!vec) {
++		if (new_map) {
++			dma_buf_io_map_drop(map);
++			req->dmabuf_map = NULL;
++			req->flags &= ~REQ_F_DROP_DMABUF;
++		}
++		return -ENOMEM;
++	}
++
++	for (i = 0; i < nr_iovs; i++) {
++		vec[i] = (struct dma_buf_io_vec) {
++			.map = map,
++			.offset = (u64)(uintptr_t)iov[i].iov_base,
++			.len = iov[i].iov_len,
++		};
++	}
++
++	kfree(io->dmabuf_vec);
++	io->dmabuf_vec = vec;
++	iov_iter_dmabuf_map_vec(iter, ddir, vec, nr_iovs, total_len);
+ 	return 0;
+ }
+ 
+@@ -1857,7 +1942,10 @@ int __io_import_reg_vec(int ddir, struct iov_iter *iter,
+ 	iov = vec->iovec + iovec_off;
+ 
+ 	if (imu->flags & IO_REGBUF_F_DMABUF) {
+-		return -EOPNOTSUPP;
++		if (!(import_flags & IO_REGBUF_IMPORT_ALLOW_DMABUF_VEC))
++			return -EOPNOTSUPP;
++		return io_import_dmabuf_vec(req, ddir, iter, imu, iov,
++				nr_iovs, issue_flags);
+ 	} else if (imu->flags & IO_REGBUF_F_KBUF) {
+ 		int ret = io_kern_bvec_size(iov, nr_iovs, imu, &nr_segs);
+ 
+diff --git a/io_uring/rsrc.h b/io_uring/rsrc.h
+index 3cb9b57f159b..842aca4f8e63 100644
+--- a/io_uring/rsrc.h
++++ b/io_uring/rsrc.h
+@@ -36,6 +36,7 @@ enum {
+ 
+ enum {
+ 	IO_REGBUF_IMPORT_ALLOW_DMABUF		= 1 << 1,
++	IO_REGBUF_IMPORT_ALLOW_DMABUF_VEC	= 1 << 2,
+ };
+ 
+ struct io_mapped_ubuf {
+diff --git a/io_uring/rw.c b/io_uring/rw.c
+index 11ff7b5a1164..48cc261fef26 100644
+--- a/io_uring/rw.c
++++ b/io_uring/rw.c
+@@ -154,6 +154,8 @@ static bool io_rw_recycle(struct io_kiocb *req, unsigned int issue_flags)
+ 	io_alloc_cache_vec_kasan(&rw->vec);
+ 	if (rw->vec.nr > IO_VEC_CACHE_SOFT_CAP)
+ 		io_vec_free(&rw->vec);
++	kfree(rw->dmabuf_vec);
++	rw->dmabuf_vec = NULL;
+ 
+ 	if (io_alloc_cache_put(&req->ctx->rw_cache, rw)) {
+ 		io_req_async_data_clear(req, 0);
+@@ -212,6 +214,7 @@ static int io_rw_alloc_async(struct io_kiocb *req)
+ 	if (rw->vec.iovec)
+ 		req->flags |= REQ_F_NEED_CLEANUP;
+ 	rw->bytes_done = 0;
++	rw->dmabuf_vec = NULL;
+ 	return 0;
+ }
+ 
+@@ -404,8 +407,9 @@ static int io_rw_import_reg_vec(struct io_kiocb *req,
+ 	unsigned uvec_segs = rw->len;
+ 	int ret;
+ 
+-	ret = io_import_reg_vec(ddir, &io->iter, req, &io->vec,
+-				uvec_segs, issue_flags);
++	ret = __io_import_reg_vec(ddir, &io->iter, req, &io->vec,
++				uvec_segs, issue_flags,
++				IO_REGBUF_IMPORT_ALLOW_DMABUF_VEC);
+ 	if (unlikely(ret))
+ 		return ret;
+ 	iov_iter_save_state(&io->iter, &io->iter_state);
+@@ -472,6 +476,8 @@ void io_readv_writev_cleanup(struct io_kiocb *req)
+ 	struct io_async_rw *rw = req->async_data;
+ 
+ 	lockdep_assert_held(&req->ctx->uring_lock);
++	kfree(rw->dmabuf_vec);
++	rw->dmabuf_vec = NULL;
+ 	io_vec_free(&rw->vec);
+ 	io_rw_recycle(req, 0);
+ }
+@@ -1402,6 +1408,7 @@ void io_rw_cache_free(const void *entry)
+ {
+ 	struct io_async_rw *rw = (struct io_async_rw *) entry;
+ 
++	kfree(rw->dmabuf_vec);
+ 	io_vec_free(&rw->vec);
+ 	kfree(rw);
+ }
+diff --git a/io_uring/rw.h b/io_uring/rw.h
+index 9bd7fbf70ea9..54cad4d4d3be 100644
+--- a/io_uring/rw.h
++++ b/io_uring/rw.h
+@@ -2,6 +2,7 @@
+ 
+ #include <linux/io_uring_types.h>
+ #include <linux/pagemap.h>
++#include <linux/dma-buf-io.h>
+ 
+ struct io_meta_state {
+ 	u32			seed;
+@@ -10,6 +11,7 @@ struct io_meta_state {
+ 
+ struct io_async_rw {
+ 	struct iou_vec			vec;
++	struct dma_buf_io_vec		*dmabuf_vec;
+ 	size_t				bytes_done;
+ 
+ 	struct_group(clear,
+diff --git a/lib/iov_iter.c b/lib/iov_iter.c
+index d6f5d7e180b5..e499ce98207c 100644
+--- a/lib/iov_iter.c
++++ b/lib/iov_iter.c
+@@ -3,6 +3,7 @@
+ #include <linux/bvec.h>
+ #include <linux/fault-inject-usercopy.h>
+ #include <linux/uio.h>
++#include <linux/dma-buf-io.h>
+ #include <linux/pagemap.h>
+ #include <linux/highmem.h>
+ #include <linux/slab.h>
+@@ -519,6 +520,29 @@ static void iov_iter_bvec_advance(struct iov_iter *i, size_t size)
+ 	i->bvec = bvec;
+ }
+ 
++static void iov_iter_dmabuf_vec_advance(struct iov_iter *i, size_t size)
++{
++	if (!i->count)
++		return;
++
++	while (size && i->nr_segs) {
++		const struct dma_buf_io_vec *vec = i->dmabuf_vec;
++		size_t len = vec->len - i->iov_offset;
++
++		if (size < len) {
++			i->iov_offset += size;
++			i->count -= size;
++			return;
++		}
++
++		size -= len;
++		i->count -= len;
++		i->dmabuf_vec++;
++		i->nr_segs--;
++		i->iov_offset = 0;
++	}
++}
++
+ static void iov_iter_iovec_advance(struct iov_iter *i, size_t size)
+ {
+ 	const struct iovec *iov, *end;
+@@ -575,8 +599,10 @@ void iov_iter_advance(struct iov_iter *i, size_t size)
+ {
+ 	if (unlikely(i->count < size))
+ 		size = i->count;
+-	if (likely(iter_is_ubuf(i)) || unlikely(iov_iter_is_xarray(i)) ||
+-	    unlikely(iov_iter_is_dmabuf_map(i))) {
++	if (unlikely(iov_iter_is_dmabuf_vec(i))) {
++		iov_iter_dmabuf_vec_advance(i, size);
++	} else if (likely(iter_is_ubuf(i)) || unlikely(iov_iter_is_xarray(i)) ||
++		   unlikely(iov_iter_is_dmabuf_map(i))) {
+ 		i->iov_offset += size;
+ 		i->count -= size;
+ 	} else if (likely(iter_is_iovec(i) || iov_iter_is_kvec(i))) {
+@@ -679,6 +705,8 @@ size_t iov_iter_single_seg_count(const struct iov_iter *i)
+ 			return min(i->count, iter_iov(i)->iov_len - i->iov_offset);
+ 		if (iov_iter_is_bvec(i))
+ 			return min(i->count, i->bvec->bv_len - i->iov_offset);
++		if (iov_iter_is_dmabuf_vec(i))
++			return min(i->count, i->dmabuf_vec->len - i->iov_offset);
+ 	}
+ 	if (unlikely(iov_iter_is_folioq(i)))
+ 		return !i->count ? 0 :
+@@ -791,6 +819,22 @@ void iov_iter_dmabuf_map(struct iov_iter *i, unsigned int direction,
+ 	};
+ }
+ 
++void iov_iter_dmabuf_map_vec(struct iov_iter *i, unsigned int direction,
++			const struct dma_buf_io_vec *vec, unsigned int nr_vecs,
++			size_t count)
++{
++	WARN_ON(direction & ~(READ | WRITE));
++	*i = (struct iov_iter){
++		.iter_type = ITER_DMABUF_MAP,
++		.data_source = direction,
++		.is_dmabuf_vec = true,
++		.dmabuf_vec = vec,
++		.nr_segs = nr_vecs,
++		.count = count,
++	};
++}
++EXPORT_SYMBOL(iov_iter_dmabuf_map_vec);
++
+ /**
+  * iov_iter_discard - Initialise an I/O iterator that discards data
+  * @i: The iterator to initialise.
+@@ -857,7 +901,10 @@ static unsigned long iov_iter_alignment_bvec(const struct iov_iter *i)
+ 
+ unsigned long iov_iter_alignment(const struct iov_iter *i)
+ {
+-	if (likely(iter_is_ubuf(i)) || iov_iter_is_dmabuf_map(i)) {
++	if (iov_iter_is_dmabuf_map(i))
++		return 0;
++
++	if (likely(iter_is_ubuf(i))) {
+ 		size_t size = i->count;
+ 		if (size)
+ 			return ((unsigned long)i->ubuf + i->iov_offset) | size;
+@@ -1480,7 +1527,7 @@ EXPORT_SYMBOL_GPL(import_ubuf);
+  * Used after iov_iter_save_state() to bring restore @i, if operations may
+  * have advanced it.
+  *
+- * Note: only works on ITER_IOVEC, ITER_BVEC, and ITER_KVEC
++ * Note: only works on ITER_IOVEC, ITER_BVEC, ITER_KVEC, and DMA-BUF vectors
+  */
+ void iov_iter_restore(struct iov_iter *i, struct iov_iter_state *state)
+ {
+@@ -1490,7 +1537,8 @@ void iov_iter_restore(struct iov_iter *i, struct iov_iter_state *state)
+ 		return;
+ 	i->iov_offset = state->iov_offset;
+ 	i->count = state->count;
+-	if (iter_is_ubuf(i) || iov_iter_is_dmabuf_map(i))
++	if (iter_is_ubuf(i) ||
++	    (iov_iter_is_dmabuf_map(i) && !iov_iter_is_dmabuf_vec(i)))
+ 		return;
+ 	/*
+ 	 * For the *vec iters, nr_segs + iov is constant - if we increment
+@@ -1504,6 +1552,8 @@ void iov_iter_restore(struct iov_iter *i, struct iov_iter_state *state)
+ 	BUILD_BUG_ON(sizeof(struct iovec) != sizeof(struct kvec));
+ 	if (iov_iter_is_bvec(i))
+ 		i->bvec -= state->nr_segs - i->nr_segs;
++	else if (iov_iter_is_dmabuf_vec(i))
++		i->dmabuf_vec -= state->nr_segs - i->nr_segs;
+ 	else
+ 		i->__iov -= state->nr_segs - i->nr_segs;
+ 	i->nr_segs = state->nr_segs;
+-- 
+2.43.0
+
