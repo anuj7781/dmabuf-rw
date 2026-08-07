@@ -1,29 +1,32 @@
-From f0ad8c534842689ca67483cf63c05539050f7cc1 Mon Sep 17 00:00:00 2001
+From bfe82e930f62badf1f7d7f0437c0b0bb928d3e7b Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
-Date: Wed, 5 Aug 2026 14:49:49 +0530
+Date: Fri, 7 Aug 2026 10:40:55 +0530
 Subject: [PATCH 1/2] nvme-multipath: pin dma-buf registrations to one path for
  block I/O
 
-Registering a dma-buf against the multipath head device (nvme_ns_head_ops)
-currently fails outright - dma-buf attachment binds to one PCI controller
-for the ctx's lifetime, but multipath can route different I/Os to different
+Registering a dma-buf against the multipath head device fails outright
+today, since a dma-buf attachment binds to one PCI controller for the
+ctx's lifetime while multipath can route different I/Os to different
 controllers. Pin the registration to whichever path is active at
-registration time, and force block I/O against that registration to the
-pinned controller, bypassing normal per-I/O path selection. If the pinned
-path is lost, I/O against that registration fails; no automatic failover -
-userspace must unregister and re-register to pick up a different path.
+registration time, and force block I/O against it to that controller,
+bypassing normal per-I/O path selection. If the pinned path is lost, I/O
+against that registration fails with no automatic failover; userspace
+must unregister and re-register to pick up a different path. A separate
+counter (io_fail_pinned_path_count) tracks this failure mode so it isn't
+conflated with "head has no usable path at all".
 
-Passthrough (nvme_ns_head_chr_fops) support is left for a follow-up.
+Passthrough support is a separate follow-up.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 ---
- drivers/nvme/host/multipath.c | 65 ++++++++++++++++++++++++++++++++++-
- drivers/nvme/host/nvme.h      | 18 ++++++++++
- drivers/nvme/host/pci.c       | 27 +++++++++++----
- 3 files changed, 102 insertions(+), 8 deletions(-)
+ drivers/nvme/host/multipath.c | 101 +++++++++++++++++++++++++++++++++-
+ drivers/nvme/host/nvme.h      |  20 +++++++
+ drivers/nvme/host/pci.c       |  27 ++++++---
+ drivers/nvme/host/sysfs.c     |   5 ++
+ 4 files changed, 145 insertions(+), 8 deletions(-)
 
 diff --git a/drivers/nvme/host/multipath.c b/drivers/nvme/host/multipath.c
-index 9b9a657fa330..0e22e8b5d082 100644
+index 9b9a657fa330..90b36977442f 100644
 --- a/drivers/nvme/host/multipath.c
 +++ b/drivers/nvme/host/multipath.c
 @@ -505,6 +505,26 @@ static bool nvme_available_path(struct nvme_ns_head *head)
@@ -77,7 +80,7 @@ index 9b9a657fa330..0e22e8b5d082 100644
 +		dev_warn_ratelimited(dev,
 +				"pinned dma-buf path unavailable - failing I/O\n");
 +		bio_io_error(bio);
-+		atomic_long_inc(&head->io_fail_no_available_path_count);
++		atomic_long_inc(&head->io_fail_pinned_path_count);
  	} else if (nvme_available_path(head)) {
  		dev_warn_ratelimited(dev, "no usable path - requeuing I/O\n");
  
@@ -126,8 +129,51 @@ index 9b9a657fa330..0e22e8b5d082 100644
  };
  
  static inline struct nvme_ns_head *cdev_to_ns_head(struct cdev *cdev)
+@@ -1259,6 +1322,42 @@ static ssize_t io_fail_no_available_path_count_store(struct device *dev,
+ 
+ DEVICE_ATTR_RW(io_fail_no_available_path_count);
+ 
++/*
++ * Separate from io_fail_no_available_path_count: this counts I/O failed
++ * because a dma-buf registration's pinned path specifically is unavailable,
++ * which can happen even while other, non-pinned paths on the same head are
++ * healthy - conflating the two would make io_fail_no_available_path_count
++ * misleading for diagnosing "is this head out of paths entirely."
++ */
++static ssize_t io_fail_pinned_path_count_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct gendisk *disk = dev_to_disk(dev);
++	struct nvme_ns_head *head = disk->private_data;
++
++	return sysfs_emit(buf, "%lu\n",
++		    atomic_long_read(&head->io_fail_pinned_path_count));
++}
++
++static ssize_t io_fail_pinned_path_count_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t count)
++{
++	int err;
++	unsigned long fail_cnt;
++	struct gendisk *disk = dev_to_disk(dev);
++	struct nvme_ns_head *head = disk->private_data;
++
++	err = kstrtoul(buf, 0, &fail_cnt);
++	if (err)
++		return -EINVAL;
++
++	atomic_long_set(&head->io_fail_pinned_path_count, fail_cnt);
++
++	return count;
++}
++
++DEVICE_ATTR_RW(io_fail_pinned_path_count);
++
+ static int nvme_lookup_ana_group_desc(struct nvme_ctrl *ctrl,
+ 		struct nvme_ana_group_desc *desc, void *data)
+ {
 diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
-index 034c31af8fec..bc2773132c07 100644
+index 034c31af8fec..112e82cb0cc9 100644
 --- a/drivers/nvme/host/nvme.h
 +++ b/drivers/nvme/host/nvme.h
 @@ -14,6 +14,7 @@
@@ -138,7 +184,15 @@ index 034c31af8fec..bc2773132c07 100644
  #include <linux/wait.h>
  #include <linux/t10-pi.h>
  #include <linux/ratelimit_types.h>
-@@ -835,6 +836,23 @@ static inline void nvme_put_ctrl(struct nvme_ctrl *ctrl)
+@@ -571,6 +572,7 @@ struct nvme_ns_head {
+ 	unsigned int		delayed_removal_secs;
+ 	atomic_long_t		io_requeue_no_usable_path_count;
+ 	atomic_long_t		io_fail_no_available_path_count;
++	atomic_long_t		io_fail_pinned_path_count;
+ #define NVME_NSHEAD_DISK_LIVE		0
+ #define NVME_NSHEAD_QUEUE_IF_NO_PATH	1
+ #define NVME_NSHEAD_CDEV_LIVE		2
+@@ -835,6 +837,23 @@ static inline void nvme_put_ctrl(struct nvme_ctrl *ctrl)
  	put_device(ctrl->device);
  }
  
@@ -162,6 +216,14 @@ index 034c31af8fec..bc2773132c07 100644
  static inline bool nvme_is_aen_req(u16 qid, __u16 command_id)
  {
  	return !qid &&
+@@ -1081,6 +1100,7 @@ extern struct device_attribute dev_attr_delayed_removal_secs;
+ extern struct device_attribute dev_attr_multipath_failover_count;
+ extern struct device_attribute dev_attr_io_requeue_no_usable_path_count;
+ extern struct device_attribute dev_attr_io_fail_no_available_path_count;
++extern struct device_attribute dev_attr_io_fail_pinned_path_count;
+ extern struct device_attribute subsys_attr_iopolicy;
+ 
+ static inline bool nvme_disk_is_ns_head(struct gendisk *disk)
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
 index d1c772d5dc51..ecf7dcc796e5 100644
 --- a/drivers/nvme/host/pci.c
@@ -227,6 +289,29 @@ index d1c772d5dc51..ecf7dcc796e5 100644
 +	ctx->dev_priv = priv;
  	ctx->dev_ops = &nvme_dma_buf_io_ops;
  	return 0;
+ }
+diff --git a/drivers/nvme/host/sysfs.c b/drivers/nvme/host/sysfs.c
+index 75b2d69b5957..67981a224a28 100644
+--- a/drivers/nvme/host/sysfs.c
++++ b/drivers/nvme/host/sysfs.c
+@@ -405,6 +405,7 @@ static struct attribute *nvme_ns_diag_attrs[] = {
+ 	&dev_attr_multipath_failover_count.attr,
+ 	&dev_attr_io_requeue_no_usable_path_count.attr,
+ 	&dev_attr_io_fail_no_available_path_count.attr,
++	&dev_attr_io_fail_pinned_path_count.attr,
+ #endif
+ 	NULL,
+ };
+@@ -437,6 +438,10 @@ static umode_t nvme_ns_diag_attrs_are_visible(struct kobject *kobj,
+ 		if (!nvme_disk_is_ns_head(dev_to_disk(dev)))
+ 			return 0;
+ 	}
++	if (a == &dev_attr_io_fail_pinned_path_count.attr) {
++		if (!nvme_disk_is_ns_head(dev_to_disk(dev)))
++			return 0;
++	}
+ #endif
+ 	return a->mode;
  }
 -- 
 2.43.0
