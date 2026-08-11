@@ -1,0 +1,318 @@
+From 8cf6e1047d9a7271b05c515897bb99ce618ced7a Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Fri, 7 Aug 2026 11:05:34 +0530
+Subject: [PATCH] nvme-multipath: pin dma-buf registrations to one path for
+ block I/O
+
+Registering a dma-buf against the multipath head device fails outright
+today, since a dma-buf attachment binds to one PCI controller for the
+ctx's lifetime while multipath can route different I/Os to different
+controllers. Pin the registration to whichever path is active at
+registration time, and force block I/O against it to that controller,
+bypassing normal per-I/O path selection. If the pinned path is lost, I/O
+against that registration fails with no automatic failover; userspace
+must unregister and re-register to pick up a different path. A separate
+counter (io_fail_pinned_path_count) tracks this failure mode so it isn't
+conflated with "head has no usable path at all".
+
+Passthrough support is a separate follow-up.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ drivers/nvme/host/multipath.c | 101 +++++++++++++++++++++++++++++++++-
+ drivers/nvme/host/nvme.h      |  20 +++++++
+ drivers/nvme/host/pci.c       |  27 ++++++---
+ drivers/nvme/host/sysfs.c     |   5 ++
+ 4 files changed, 145 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/nvme/host/multipath.c b/drivers/nvme/host/multipath.c
+index 9b9a657fa330..90b36977442f 100644
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@ -505,6 +505,26 @@ static bool nvme_available_path(struct nvme_ns_head *head)
+ 	return nvme_mpath_queue_if_no_path(head);
+ }
+ 
++/*
++ * Find the path this head's dma-buf registration is pinned to, if it's still
++ * usable. A pinned controller can remain on head->list while no longer being
++ * a valid path (resetting, failed, ANA-pending) - nvme_path_is_disabled()
++ * already covers all of that, reuse it rather than reimplementing. Must be
++ * called with head->srcu held.
++ */
++static struct nvme_ns *nvme_ns_head_find_pinned_path(struct nvme_ns_head *head,
++						      struct nvme_ctrl *pinned_ctrl)
++{
++	struct nvme_ns *ns;
++
++	list_for_each_entry_srcu(ns, &head->list, siblings,
++				 srcu_read_lock_held(&head->srcu)) {
++		if (ns->ctrl == pinned_ctrl)
++			return nvme_path_is_disabled(ns) ? NULL : ns;
++	}
++	return NULL;
++}
++
+ static void nvme_ns_head_submit_bio(struct bio *bio)
+ {
+ 	struct nvme_ns_head *head = bio->bi_bdev->bd_disk->private_data;
+@@ -522,7 +542,13 @@ static void nvme_ns_head_submit_bio(struct bio *bio)
+ 		return;
+ 
+ 	srcu_idx = srcu_read_lock(&head->srcu);
+-	ns = nvme_find_path(head);
++
++	if (op_is_dmabuf(bio->bi_opf))
++		ns = nvme_ns_head_find_pinned_path(head,
++				nvme_dmabuf_pinned_ctrl(bio->bi_dmabuf_map->ctx));
++	else
++		ns = nvme_find_path(head);
++
+ 	if (likely(ns)) {
+ 		bio_set_dev(bio, ns->disk->part0);
+ 		/*
+@@ -535,6 +561,12 @@ static void nvme_ns_head_submit_bio(struct bio *bio)
+ 		trace_block_bio_remap(bio, disk_devt(ns->head->disk),
+ 				      bio->bi_iter.bi_sector);
+ 		submit_bio_noacct(bio);
++	} else if (op_is_dmabuf(bio->bi_opf)) {
++		/* pinned path is gone - no multipath requeue, hard fail */
++		dev_warn_ratelimited(dev,
++				"pinned dma-buf path unavailable - failing I/O\n");
++		bio_io_error(bio);
++		atomic_long_inc(&head->io_fail_pinned_path_count);
+ 	} else if (nvme_available_path(head)) {
+ 		dev_warn_ratelimited(dev, "no usable path - requeuing I/O\n");
+ 
+@@ -598,6 +630,36 @@ static int nvme_ns_head_report_zones(struct gendisk *disk, sector_t sector,
+ #define nvme_ns_head_report_zones	NULL
+ #endif /* CONFIG_BLK_DEV_ZONED */
+ 
++/*
++ * Pin a dma-buf registration to whichever path is active right now, and hold
++ * a reference on that controller for as long as the registration lives -
++ * nvme_find_path() only guarantees its result is valid while head->srcu is
++ * held, and I/O against this registration will need to keep targeting this
++ * one controller directly, bypassing normal multipath path selection, for
++ * the lifetime of the registration. If the pinned path is later lost, I/O
++ * against this registration fails; there is no automatic re-pin - userspace
++ * must unregister and re-register to pick up a different active path.
++ */
++static int nvme_ns_head_init_dma_buf_io_ctx(struct block_device *bdev,
++					     struct dma_buf_io_ctx *ctx)
++{
++	struct nvme_ns_head *head = bdev->bd_disk->private_data;
++	int srcu_idx = srcu_read_lock(&head->srcu);
++	struct nvme_ns *ns = nvme_find_path(head);
++	int ret = -ENODEV;
++
++	if (ns && ns->ctrl->ops->init_dma_buf_io_ctx) {
++		nvme_get_ctrl(ns->ctrl);
++		ret = ns->ctrl->ops->init_dma_buf_io_ctx(ns->ctrl, ctx);
++		if (ret)
++			nvme_put_ctrl(ns->ctrl);
++		else
++			((struct nvme_dmabuf_attach *)ctx->dev_priv)->pinned_ctrl = ns->ctrl;
++	}
++	srcu_read_unlock(&head->srcu, srcu_idx);
++	return ret;
++}
++
+ const struct block_device_operations nvme_ns_head_ops = {
+ 	.owner		= THIS_MODULE,
+ 	.submit_bio	= nvme_ns_head_submit_bio,
+@@ -609,6 +671,7 @@ const struct block_device_operations nvme_ns_head_ops = {
+ 	.get_unique_id	= nvme_ns_head_get_unique_id,
+ 	.report_zones	= nvme_ns_head_report_zones,
+ 	.pr_ops		= &nvme_pr_ops,
++	.init_dma_buf_io_ctx = nvme_ns_head_init_dma_buf_io_ctx,
+ };
+ 
+ static inline struct nvme_ns_head *cdev_to_ns_head(struct cdev *cdev)
+@@ -1259,6 +1322,42 @@ static ssize_t io_fail_no_available_path_count_store(struct device *dev,
+ 
+ DEVICE_ATTR_RW(io_fail_no_available_path_count);
+ 
++/*
++ * Separate from io_fail_no_available_path_count: this counts I/O failed
++ * because a dma-buf registration's pinned path specifically is unavailable,
++ * which can happen even while other, non-pinned paths on the same head are
++ * healthy - conflating the two would make io_fail_no_available_path_count
++ * misleading for diagnosing "is this head out of paths entirely."
++ */
++static ssize_t io_fail_pinned_path_count_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct gendisk *disk = dev_to_disk(dev);
++	struct nvme_ns_head *head = disk->private_data;
++
++	return sysfs_emit(buf, "%lu\n",
++		    atomic_long_read(&head->io_fail_pinned_path_count));
++}
++
++static ssize_t io_fail_pinned_path_count_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t count)
++{
++	int err;
++	unsigned long fail_cnt;
++	struct gendisk *disk = dev_to_disk(dev);
++	struct nvme_ns_head *head = disk->private_data;
++
++	err = kstrtoul(buf, 0, &fail_cnt);
++	if (err)
++		return -EINVAL;
++
++	atomic_long_set(&head->io_fail_pinned_path_count, fail_cnt);
++
++	return count;
++}
++
++DEVICE_ATTR_RW(io_fail_pinned_path_count);
++
+ static int nvme_lookup_ana_group_desc(struct nvme_ctrl *ctrl,
+ 		struct nvme_ana_group_desc *desc, void *data)
+ {
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 034c31af8fec..112e82cb0cc9 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -14,6 +14,7 @@
+ #include <linux/sed-opal.h>
+ #include <linux/fault-inject.h>
+ #include <linux/rcupdate.h>
++#include <linux/dma-buf-io.h>
+ #include <linux/wait.h>
+ #include <linux/t10-pi.h>
+ #include <linux/ratelimit_types.h>
+@@ -571,6 +572,7 @@ struct nvme_ns_head {
+ 	unsigned int		delayed_removal_secs;
+ 	atomic_long_t		io_requeue_no_usable_path_count;
+ 	atomic_long_t		io_fail_no_available_path_count;
++	atomic_long_t		io_fail_pinned_path_count;
+ #define NVME_NSHEAD_DISK_LIVE		0
+ #define NVME_NSHEAD_QUEUE_IF_NO_PATH	1
+ #define NVME_NSHEAD_CDEV_LIVE		2
+@@ -835,6 +837,23 @@ static inline void nvme_put_ctrl(struct nvme_ctrl *ctrl)
+ 	put_device(ctrl->device);
+ }
+ 
++/*
++ * dev_priv for a dma-buf ctx created via nvme_ctrl_ops.init_dma_buf_io_ctx().
++ * pinned_ctrl is only set for a registration made through a multipath head -
++ * it identifies the one controller the registration is pinned to, since a
++ * dma-buf attachment can't follow multipath's per-I/O dynamic path
++ * selection. NULL for a direct, single-controller registration.
++ */
++struct nvme_dmabuf_attach {
++	struct dma_buf_attachment *attach;
++	struct nvme_ctrl *pinned_ctrl;
++};
++
++static inline struct nvme_ctrl *nvme_dmabuf_pinned_ctrl(struct dma_buf_io_ctx *ctx)
++{
++	return ((struct nvme_dmabuf_attach *)ctx->dev_priv)->pinned_ctrl;
++}
++
+ static inline bool nvme_is_aen_req(u16 qid, __u16 command_id)
+ {
+ 	return !qid &&
+@@ -1081,6 +1100,7 @@ extern struct device_attribute dev_attr_delayed_removal_secs;
+ extern struct device_attribute dev_attr_multipath_failover_count;
+ extern struct device_attribute dev_attr_io_requeue_no_usable_path_count;
+ extern struct device_attribute dev_attr_io_fail_no_available_path_count;
++extern struct device_attribute dev_attr_io_fail_pinned_path_count;
+ extern struct device_attribute subsys_attr_iopolicy;
+ 
+ static inline bool nvme_disk_is_ns_head(struct gendisk *disk)
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index d1c772d5dc51..ecf7dcc796e5 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -2600,7 +2600,8 @@ const struct dma_buf_attach_ops nvme_dmabuf_importer_ops = {
+ static struct dma_buf_io_map *nvme_dma_buf_io_map(struct dma_buf_io_ctx *ctx)
+ {
+ 	unsigned nr_entries = ctx->dmabuf->size / NVME_CTRL_PAGE_SIZE;
+-	struct dma_buf_attachment *attach = ctx->dev_priv;
++	struct nvme_dmabuf_attach *priv = ctx->dev_priv;
++	struct dma_buf_attachment *attach = priv->attach;
+ 	unsigned long tmp, i = 0;
+ 	unsigned seg_shift = ~0U;
+ 	struct nvme_dmabuf_map *map;
+@@ -2682,7 +2683,8 @@ static struct dma_buf_io_map *nvme_dma_buf_io_map(struct dma_buf_io_ctx *ctx)
+ static void nvme_dma_buf_io_unmap(struct dma_buf_io_ctx *ctx,
+ 				  struct dma_buf_io_map *map_base)
+ {
+-	struct dma_buf_attachment *attach = ctx->dev_priv;
++	struct nvme_dmabuf_attach *priv = ctx->dev_priv;
++	struct dma_buf_attachment *attach = priv->attach;
+ 	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(map_base);
+ 
+ 	dma_resv_assert_held(ctx->dmabuf->resv);
+@@ -2696,9 +2698,12 @@ static void nvme_dma_buf_io_unmap(struct dma_buf_io_ctx *ctx,
+ 
+ static void nvme_dma_buf_io_release(struct dma_buf_io_ctx *ctx)
+ {
+-	struct dma_buf_attachment *attach = ctx->dev_priv;
++	struct nvme_dmabuf_attach *priv = ctx->dev_priv;
+ 
+-	dma_buf_detach(ctx->dmabuf, attach);
++	dma_buf_detach(ctx->dmabuf, priv->attach);
++	if (priv->pinned_ctrl)
++		nvme_put_ctrl(priv->pinned_ctrl);
++	kfree(priv);
+ }
+ 
+ const struct dma_buf_io_ops nvme_dma_buf_io_ops = {
+@@ -2710,15 +2715,23 @@ const struct dma_buf_io_ops nvme_dma_buf_io_ops = {
+ static int nvme_pci_init_dma_buf_io_ctx(struct nvme_ctrl *ctrl,
+ 					struct dma_buf_io_ctx *ctx)
+ {
+-	struct dma_buf_attachment *attach;
+ 	struct nvme_dev *dev = to_nvme_dev(ctrl);
++	struct nvme_dmabuf_attach *priv;
++	struct dma_buf_attachment *attach;
++
++	priv = kzalloc_obj(*priv);
++	if (!priv)
++		return -ENOMEM;
+ 
+ 	attach = dma_buf_dynamic_attach(ctx->dmabuf, dev->dev,
+ 					&nvme_dmabuf_importer_ops, ctx);
+-	if (IS_ERR(attach))
++	if (IS_ERR(attach)) {
++		kfree(priv);
+ 		return PTR_ERR(attach);
++	}
+ 
+-	ctx->dev_priv = attach;
++	priv->attach = attach;
++	ctx->dev_priv = priv;
+ 	ctx->dev_ops = &nvme_dma_buf_io_ops;
+ 	return 0;
+ }
+diff --git a/drivers/nvme/host/sysfs.c b/drivers/nvme/host/sysfs.c
+index 75b2d69b5957..67981a224a28 100644
+--- a/drivers/nvme/host/sysfs.c
++++ b/drivers/nvme/host/sysfs.c
+@@ -405,6 +405,7 @@ static struct attribute *nvme_ns_diag_attrs[] = {
+ 	&dev_attr_multipath_failover_count.attr,
+ 	&dev_attr_io_requeue_no_usable_path_count.attr,
+ 	&dev_attr_io_fail_no_available_path_count.attr,
++	&dev_attr_io_fail_pinned_path_count.attr,
+ #endif
+ 	NULL,
+ };
+@@ -437,6 +438,10 @@ static umode_t nvme_ns_diag_attrs_are_visible(struct kobject *kobj,
+ 		if (!nvme_disk_is_ns_head(dev_to_disk(dev)))
+ 			return 0;
+ 	}
++	if (a == &dev_attr_io_fail_pinned_path_count.attr) {
++		if (!nvme_disk_is_ns_head(dev_to_disk(dev)))
++			return 0;
++	}
+ #endif
+ 	return a->mode;
+ }
+-- 
+2.43.0
+
