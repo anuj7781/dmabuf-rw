@@ -1,7 +1,7 @@
-From 8cf6e1047d9a7271b05c515897bb99ce618ced7a Mon Sep 17 00:00:00 2001
+From 088c3d700c409e5ffd9d8c23997c2e74c5eb144e Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Fri, 7 Aug 2026 11:05:34 +0530
-Subject: [PATCH] nvme-multipath: pin dma-buf registrations to one path for
+Subject: [PATCH 4/6] nvme-multipath: pin dma-buf registrations to one path for
  block I/O
 
 Registering a dma-buf against the multipath head device fails outright

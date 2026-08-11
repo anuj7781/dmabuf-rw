@@ -1,7 +1,8 @@
-From 94317a90310268e447fc9f62d5b8578896f940de Mon Sep 17 00:00:00 2001
+From 9eee3f8a2fea8f6d9d844fc553d05a35086e479f Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Tue, 4 Aug 2026 10:07:47 +0530
-Subject: [PATCH] nvme-pci: reuse a precomputed PRP list for dma-buf backed I/O
+Subject: [PATCH 3/6] nvme-pci: reuse a precomputed PRP list for dma-buf backed
+ I/O
 
 Precompute a PRP list for the whole registered dma-buf at map time,
 bounded by the existing io_uring dma-buf size limit. I/O whose PRP

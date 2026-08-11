@@ -1,7 +1,7 @@
-From 3fab37b15c2f42c0ed79bf34f4380dc7dd4ab38f Mon Sep 17 00:00:00 2001
+From 1351fc3e3a916c31c0eb894142092cf93d16937b Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Fri, 7 Aug 2026 11:06:25 +0530
-Subject: [PATCH] nvme-multipath: support dma-buf passthrough I/O
+Subject: [PATCH 5/6] nvme-multipath: support dma-buf passthrough I/O
 
 Extend the block I/O pinned-path support to passthrough. Add
 io_uring_cmd_peek_dmabuf_ctx() to check whether a uring_cmd's fixed
