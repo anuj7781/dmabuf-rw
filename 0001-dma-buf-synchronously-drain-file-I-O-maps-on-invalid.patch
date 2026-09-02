@@ -1,0 +1,347 @@
+From 8fabb77b2b4c600352c227ea4abc3deea7d5b279 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj1072538@gmail.com>
+Date: Wed, 2 Sep 2026 08:13:57 +0530
+Subject: [PATCH] dma-buf: synchronously drain file I/O maps on invalidation
+
+A dynamic file-I/O importer caches a DMA-BUF mapping while I/O owns a
+percpu reference to it. Invalidation currently unpublishes the map, adds a
+map-drain fence to the reservation object, and queues the final unmap on
+system_wq.
+
+That design has two forward-progress defects. DMA-FENCE permits a waiter
+to hold the reservation lock, but the work item required to signal the
+published fence subsequently takes that same lock for importer unmap. In
+addition, the required signaler depends on system_wq, so reclaim/fence
+waiting can starve it. The map-creation protocol also waits before taking
+the reservation lock and then treats a zero-timeout pending result as
+success, allowing an exporter-installed fence to race the map operation.
+
+Remove the map from publication while holding the reservation lock, kill
+its percpu reference, and wait for outstanding request references to drain.
+The final put directly completes the wait; it neither queues work nor takes
+the reservation lock. The invalidating caller then unmaps and frees the map
+under the same lock before returning. This eliminates the map-drain fence,
+its signalling path, and the workqueue dependency.
+
+Map creation now performs its dependency wait while holding the
+reservation lock, preventing a fence installation between the wait and map
+operation; it treats `<= 0` as failure. Clean up a newly-created map on the
+invalid `seg_shift` path. Use kref for context lifetime and document the
+`seg_shift` map-callback contract.
+
+The selected DMA_RESV_USAGE_WRITE dependency class requires separate
+coherency validation with real dynamic GPU exporters.
+
+Fixes: ff5dccf71e8c ("dma-buf: introduce initial file I/O infrastructure")
+Signed-off-by: Anuj Gupta <anuj1072538@gmail.com>
+---
+ drivers/dma-buf/dma-buf-io.c | 167 +++++++----------------------------
+ include/linux/dma-buf-io.h   |  16 ++--
+ 2 files changed, 42 insertions(+), 141 deletions(-)
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index 24f58f80c45c..1addd643f498 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -7,110 +7,32 @@
+ #include <linux/dma-buf-io.h>
+ #include <linux/dma-resv.h>
+ 
+-struct dma_buf_io_fence {
+-	struct dma_fence base;
+-	spinlock_t lock;
+-};
+-
+-static const char *dma_buf_io_fence_drv_name(struct dma_fence *fence)
+-{
+-	/* default fence release kfree's the base pointer */
+-	BUILD_BUG_ON(offsetof(struct dma_buf_io_fence, base));
+-
+-	return "dma-buf-io-ctx";
+-}
+-
+-static const char *dma_buf_io_fence_timeline_name(struct dma_fence *fence)
+-{
+-	return "dma-buf-io-ctx";
+-}
+-
+-const struct dma_fence_ops dma_buf_io_fence_ops = {
+-	.get_driver_name = dma_buf_io_fence_drv_name,
+-	.get_timeline_name = dma_buf_io_fence_timeline_name,
+-};
+-
+-static void dma_buf_io_ctx_destroy_work(struct work_struct *work)
++static void dma_buf_io_ctx_destroy(struct kref *ref)
+ {
+-	struct dma_buf_io_ctx *ctx = container_of(work, struct dma_buf_io_ctx,
+-						  release_work);
+-
+-	if (WARN_ON_ONCE(refcount_read(&ctx->refs)))
+-		return;
++	struct dma_buf_io_ctx *ctx = container_of(ref, struct dma_buf_io_ctx,
++						  refs);
+ 
+ 	ctx->dev_ops->release(ctx);
+ 	dma_buf_put(ctx->dmabuf);
+ 	kfree(ctx);
+ }
+ 
+-static void dma_buf_io_map_release_work(struct work_struct *work)
+-{
+-	struct dma_buf_io_map *map = container_of(work, struct dma_buf_io_map,
+-						  release_work);
+-	struct dma_buf_io_fence *fence = map->fence;
+-	struct dma_buf_io_ctx *ctx = map->ctx;
+-	struct dma_buf *dmabuf = ctx->dmabuf;
+-
+-	/* the release path must wait for fences */
+-	if (WARN_ON_ONCE(refcount_read(&ctx->refs) == 0))
+-		return;
+-
+-	/* Prevent from destoying the ctx while unmapping */
+-	refcount_inc(&ctx->refs);
+-
+-	/*
+-	 * There are no more requests using the map, we can signal the fence.
+-	 * It should be done before taking the resv lock as someone could be
+-	 * waiting for the fence while holding the lock.
+-	 */
+-	dma_fence_signal(&fence->base);
+-
+-	dma_resv_lock(dmabuf->resv, NULL);
+-	ctx->dev_ops->unmap(ctx, map);
+-	dma_resv_unlock(dmabuf->resv);
+-
+-	dma_fence_put(&fence->base);
+-	percpu_ref_exit(&map->refs);
+-	kfree(map);
+-
+-	if (refcount_dec_and_test(&ctx->refs)) {
+-		/*
+-		 * Destruction needs to wait for I/O and dma fences. Defer it to
+-		 * simplify locking.
+-		 */
+-		INIT_WORK(&ctx->release_work, dma_buf_io_ctx_destroy_work);
+-		queue_work(system_wq, &ctx->release_work);
+-	}
+-}
+-
+ static void dma_buf_io_map_refs_release(struct percpu_ref *ref)
+ {
+ 	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, refs);
+ 
+-	/* might sleep, use a worker */
+-	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
+-	queue_work(system_wq, &map->release_work);
++	complete(&map->drain);
+ }
+ 
+ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+ {
+-	struct dma_buf_io_fence *fence = NULL;
+ 	int ret;
+ 
+-	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
+-	if (!fence)
+-		return -ENOMEM;
+-
+ 	ret = percpu_ref_init(&map->refs, dma_buf_io_map_refs_release, 0, GFP_KERNEL);
+-	if (ret) {
+-		kfree(fence);
++	if (ret)
+ 		return ret;
+-	}
+ 
+-	spin_lock_init(&fence->lock);
+-	dma_fence_init(&fence->base, &dma_buf_io_fence_ops, &fence->lock,
+-			ctx->fence_ctx, atomic_inc_return(&ctx->fence_seq));
+-	map->fence = fence;
++	init_completion(&map->drain);
+ 	map->ctx = ctx;
+ 	return 0;
+ }
+@@ -122,19 +44,6 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 	struct dma_buf_io_map *map;
+ 	long ret;
+ 
+-retry:
+-	/*
+-	 * ->dmabuf_map() will be calling dma_buf_map_attachment(), for which
+-	 * we'll need to wait for fences. Do a bit nicer and try to wait
+-	 * without the resv lock first.
+-	 */
+-	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
+-				    true, MAX_SCHEDULE_TIMEOUT);
+-	if (!ret)
+-		ret = -EAGAIN;
+-	if (ret < 0)
+-		return ERR_PTR(ret);
+-
+ 	ret = dma_resv_lock_interruptible(dmabuf->resv, NULL);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+@@ -145,10 +54,16 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 		goto out;
+ 	}
+ 
+-	if (dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
+-				  true, 0) < 0) {
+-		dma_resv_unlock(dmabuf->resv);
+-		goto retry;
++	/*
++	 * An exporter can install a fence while holding the reservation lock.
++	 * Waiting before taking it would leave a race with the map operation.
++	 */
++	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_WRITE,
++				    true, MAX_SCHEDULE_TIMEOUT);
++	if (ret <= 0) {
++		if (!ret)
++			ret = -EAGAIN;
++		goto out;
+ 	}
+ 
+ 	map = ctx->dev_ops->map(ctx);
+@@ -157,8 +72,12 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 		goto out;
+ 	}
+ 
+-	if (WARN_ON_ONCE(!map->seg_shift))
+-		return ERR_PTR(-EFAULT);
++	if (WARN_ON_ONCE(!map->seg_shift)) {
++		ctx->dev_ops->unmap(ctx, map);
++		percpu_ref_exit(&map->refs);
++		ret = -EFAULT;
++		goto out;
++	}
+ 
+ 	percpu_ref_get(&map->refs);
+ 	rcu_assign_pointer(ctx->map, map);
+@@ -173,8 +92,6 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ {
+ 	struct dma_buf *dmabuf = ctx->dmabuf;
+ 	struct dma_buf_io_map *map;
+-	int ret;
+-
+ 	dma_resv_assert_held(dmabuf->resv);
+ 
+ 	map = rcu_dereference_protected(ctx->map,
+@@ -183,24 +100,17 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 		return;
+ 	rcu_assign_pointer(ctx->map, NULL);
+ 
+-	ret = dma_resv_reserve_fences(dmabuf->resv, 1);
+-	if (WARN_ON_ONCE(ret)) {
+-		struct dma_fence *fence = &map->fence->base;
+-
+-		dma_fence_get(fence);
+-		percpu_ref_kill(&map->refs);
+-		dma_fence_wait(fence, false);
+-		dma_fence_put(fence);
+-		return;
+-	}
+-
+-	dma_resv_add_fence(dmabuf->resv, &map->fence->base,
+-			   DMA_RESV_USAGE_KERNEL);
+ 	/*
+-	 * Delay destruction until all inflight requests using the map are
+-	 * gone. It'll also signal the fence then.
++	 * The exporter invalidates mappings while holding the reservation lock.
++	 * Stop new users, drain existing requests, and unmap before returning.
++	 * This avoids publishing a reservation fence whose completion path would
++	 * need to acquire this lock.
+ 	 */
+ 	percpu_ref_kill(&map->refs);
++	wait_for_completion(&map->drain);
++	ctx->dev_ops->unmap(ctx, map);
++	percpu_ref_exit(&map->refs);
++	kfree(map);
+ }
+ 
+ void dma_buf_io_invalidate_mappings(struct dma_buf_io_ctx *ctx)
+@@ -214,24 +124,12 @@ static void dma_buf_io_ctx_release_work(struct work_struct *work)
+ 	struct dma_buf_io_ctx *ctx = container_of(work, struct dma_buf_io_ctx,
+ 						  release_work);
+ 	struct dma_buf *dmabuf = ctx->dmabuf;
+-	long ret;
+-
+ 	dma_resv_lock(dmabuf->resv, NULL);
+ 	/* Remove the last map, there should be no new ones going forward. */
+ 	dma_buf_io_drop_map(ctx);
+ 	dma_resv_unlock(dmabuf->resv);
+ 
+-	/* Wait until all maps are destroyed. */
+-	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
+-				    false, MAX_SCHEDULE_TIMEOUT);
+-
+-	if (WARN_ON_ONCE(ret <= 0))
+-		return;
+-	if (WARN_ON_ONCE(rcu_dereference_protected(ctx->map, true)))
+-		return;
+-
+-	if (refcount_dec_and_test(&ctx->refs))
+-		dma_buf_io_ctx_destroy_work(&ctx->release_work);
++	kref_put(&ctx->refs, dma_buf_io_ctx_destroy);
+ }
+ 
+ void dma_buf_io_ctx_release(struct dma_buf_io_ctx *ctx)
+@@ -255,10 +153,9 @@ int dma_buf_io_ctx_create(struct file *file,
+ 		return -EOPNOTSUPP;
+ 
+ 	memset(ctx, 0, sizeof(*ctx));
+-	ctx->fence_ctx = dma_fence_context_alloc(1);
+ 	ctx->dir = dir;
+ 	ctx->dmabuf = dmabuf;
+-	refcount_set(&ctx->refs, 1);
++	kref_init(&ctx->refs);
+ 	get_dma_buf(dmabuf);
+ 
+ 	ret = file->f_op->init_dma_buf_io_ctx(file, ctx);
+diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
+index 31d5b1e82639..e153b32e8a33 100644
+--- a/include/linux/dma-buf-io.h
++++ b/include/linux/dma-buf-io.h
+@@ -2,9 +2,10 @@
+ #ifndef __DMA_BUF_IO_H__
+ #define __DMA_BUF_IO_H__
+ 
++#include <linux/completion.h>
+ #include <linux/dma-buf.h>
++#include <linux/kref.h>
+ 
+-struct dma_buf_io_fence;
+ struct dma_buf_io_ctx;
+ struct dma_buf_io_map;
+ 
+@@ -49,10 +50,15 @@ struct dma_buf_io_map {
+ 	 * is deferred until all refs are dropped.
+ 	 */
+ 	struct percpu_ref		refs;
++	/*
++	 * Device DMA segment size encoded as a power-of-2 shift.  For example
++	 * seg_shift=12 means 4 KiB segments.  bio_split_io_at_dmabuf() uses
++	 * this to find the split point that respects lim->max_segments.  Must
++	 * be set by the driver's map() callback before returning the map.
++	 */
+ 	unsigned			seg_shift;
+ 
+-	struct work_struct		release_work;
+-	struct dma_buf_io_fence		*fence;
++	struct completion			drain;
+ 	struct dma_buf_io_ctx		*ctx;
+ };
+ 
+@@ -61,10 +67,8 @@ struct dma_buf_io_ctx {
+ 	struct dma_buf				*dmabuf;
+ 	enum dma_data_direction			dir;
+ 
+-	atomic_t				fence_seq;
+-	u64					fence_ctx;
+ 	struct work_struct			release_work;
+-	refcount_t				refs;
++	struct kref				refs;
+ 
+ 	void					*dev_priv;
+ 	const struct dma_buf_io_ops		*dev_ops;
+-- 
+2.43.0
+
