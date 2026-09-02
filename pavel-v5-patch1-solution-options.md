@@ -28,8 +28,9 @@ allows waiters to hold that lock.  Reject for v6.
 
 Reject.  The DMA-BUF locking convention requires dynamic importers to hold the
 reservation lock for `dma_buf_unmap_attachment()`.  The earlier local prototype
-that removed this lock requirement conflicts with the current common DMA-BUF
-contract and must not be used.
+`0001-io_dmabuf-drop-resv-lock-requirement-from-map-releas.patch` removed this
+lock requirement. It conflicts with the current common DMA-BUF contract and
+must not be used.
 
 ### 3. Synchronously drain and unmap under the reservation lock
 
@@ -57,8 +58,9 @@ validate for every importer adopting the common API.
 - Simplify context release to lock, drop the final map synchronously, unlock,
   then release importer state.  It no longer waits on map-drain fences.
 - Rework map creation to use one reservation-lock-protected wait protocol and
-  treat a zero-timeout pending result as retry/failure, never as permission to
-  map.
+  remove the pre-lock wait and zero-timeout recheck. The single locked wait
+  treats `<= 0` as failure (`-EAGAIN` for a zero return), never as permission
+  to map. This resolves Sidong Yang's v5 race.
 
 ## Validation requirements
 
@@ -68,6 +70,10 @@ validate for every importer adopting the common API.
 - allocation and interrupted-wait failures;
 - lockdep with a dynamic GPU exporter and forced movement;
 - reclaim/workqueue stress proving no required fence signaler remains.
+- **Before submission, justify `DMA_RESV_USAGE_WRITE` in map creation with a
+  GPU exporter that installs WRITE fences.** Verify the intended
+  direction-specific file-I/O coherency contract: whether it must implicitly
+  wait for producer writes, or whether userspace is responsible for ordering.
 
 ## Source basis
 

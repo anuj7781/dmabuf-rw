@@ -4,22 +4,23 @@
 
 The v4 feedback arrived after v5 was sent.  It is not a collection of cosmetic
 cleanups: the lock/fence feedback identifies a contract violation in v5's
-asynchronous invalidation design.  `seg_shift` is the only material patch-1
-change in v5, so all lifecycle feedback below must be considered open unless a
-later, unpublished respin changes the design.
+asynchronous invalidation design. `seg_shift` is the only material patch-1
+change in v5. The disposition below also records what the proposed
+synchronous-drain v6 fix resolves, rather than leaving resolved fence-specific
+items looking open.
 
 ## Feedback matrix
 
 | Reviewer and point | v5 status | Disposition |
 | --- | --- | --- |
-| Christian: use embedded DMA-FENCE lock | Still uses wrapper with a separate spinlock. | Minor cleanup; use the current DMA-FENCE facility if the fence design survives. |
-| Christian: direct refcount warning/use `kref` | Same direct `refcount_t` pattern. | Style/robustness review item; not the principal deadlock. |
-| Christian: fence signalling has strict rules | Worker signals a reservation-published fence. | Still applicable and fundamental. |
-| Christian: wait under `dma_resv` rather than before it | v5 retains outside-lock wait plus zero-timeout recheck. | Still applicable.  The design must use one coherent lock/wait protocol. |
-| Christian: reserve fence slot before creating/initing fence | v5 creates/initialises at map allocation, before invalidation calls `dma_resv_reserve_fences()`. | Still applicable.  Publication must enter a no-allocation signalling-critical region. |
-| Matthew: `system_wq` may deadlock through reclaim/fence waiting | v5 queues the only required signaler to `system_wq`. | Still applicable and independently corroborated by local v4 hang work. |
-| Christoph: explain `seg_shift` | v5 adds it but the comment remains insufficient. | Documentation follow-up; unrelated to lifetime correctness. |
-| Sidong: zero-timeout retry must include `0` | v5 tests `< 0`. | Still applicable: a pending fence after the initial wait returns `0`; mapping otherwise proceeds. |
+| Christian: use embedded DMA-FENCE lock | Still uses wrapper with a separate spinlock. | Moot in the proposed v6 fix: synchronous draining eliminates the map fence. |
+| Christian: direct refcount warning/use `kref` | Same direct `refcount_t` pattern. | Resolved in the proposed v6 fix: context lifetime uses `kref`. |
+| Christian: fence signalling has strict rules | Worker signals a reservation-published fence. | Resolved in the proposed v6 fix: no map fence is published or signalled. |
+| Christian: wait under `dma_resv` rather than before it | v5 retains outside-lock wait plus zero-timeout recheck. | Resolved in the proposed v6 fix: `dma_buf_io_create_map()` waits while holding the reservation lock. |
+| Christian: reserve fence slot before creating/initing fence | v5 creates/initialises at map allocation, before invalidation calls `dma_resv_reserve_fences()`. | Moot in the proposed v6 fix: there is no reservation-fence publication. |
+| Matthew: `system_wq` may deadlock through reclaim/fence waiting | v5 queues the only required signaler to `system_wq`. | Resolved in the proposed v6 fix: the final request put completes a waiter directly. |
+| Christoph: explain `seg_shift` | v5 adds it but the comment remains insufficient. | Resolved in the proposed v6 fix with a map-callback contract comment. |
+| Sidong: zero-timeout retry must include `0` | v5 tests `< 0`. | Resolved in the proposed v6 fix: the zero-timeout recheck is gone; the single locked wait treats `<= 0` as failure. |
 
 ## Christian's core rule in context
 
@@ -37,14 +38,15 @@ before the reservation lock is released.  `dma_fence_begin_signalling()` is a
 lockdep annotation, not a mechanism that makes an arbitrary workqueue path
 safe.
 
-## Semantics not settled by the original feedback
+## Remaining correctness question: map-creation dependency class
 
-The map-creation dependency class must be chosen from the actual I/O coherency
-contract, not from the old map-drain fence.  A DMA-BUF file-I/O request needs
-producer writes complete before device access; that is at least
-`DMA_RESV_USAGE_WRITE`.  The implementation must verify the direction-specific
-contract and any exporter map callback that waits more broadly.  Removing the
-importer drain fence separates this question from revocation lifetime.
+The proposed implementation waits at `DMA_RESV_USAGE_WRITE` before creating a
+map. That is correct only if the file-I/O coherency contract promises implicit
+waiting for producer WRITE fences before the target device accesses the buffer.
+It must be justified with a real GPU exporter and direction-specific I/O tests;
+some GPUDirect-style users may instead require userspace to order GPU and
+storage work explicitly. This is independent of the resolved map-lifetime
+problem and is the remaining architectural question before proposing v6.
 
 ## References
 

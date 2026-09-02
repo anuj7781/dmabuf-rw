@@ -52,6 +52,26 @@ revocation.  The common layer must not require its completion path to acquire
 | Unmap | The worker signals the published fence, takes `dmabuf->resv`, invokes importer unmap, then frees the map. |
 | Release | Another worker drops the last map, waits on reservation fences, releases importer state, drops the dma-buf reference, and frees the context. |
 
+## Synchronous-drain lifecycle (proposed v6 fix)
+
+The proposed replacement removes the importer-owned map fence. It keeps the
+DMA-BUF locking rule intact: both map and unmap still run with
+`dmabuf->resv` held.
+
+| Phase | State and synchronization |
+| --- | --- |
+| Register | The target file creates the context and its dynamic DMA-BUF attachment. |
+| First I/O | A caller obtains a live `ctx->map` under RCU, or takes `dmabuf->resv`, waits for the selected dependencies, creates the map, and publishes it. |
+| I/O | A request owns one live `percpu_ref`; completing the request drops that reference without taking `dmabuf->resv`. |
+| Invalidate | Exporter holds `dmabuf->resv`; common code unpublishes `ctx->map` and kills the map ref, preventing any new request from acquiring it. |
+| Drain | The invalidating caller waits on a completion. The final request put directly completes it; it does not queue work or signal a reservation fence. |
+| Unmap | The same invalidating caller invokes importer unmap, exits the refcount, and frees the map while still holding `dmabuf->resv`. Only then does invalidation return. |
+| Release | Release work takes `dmabuf->resv`, runs the same synchronous map drop, unlocks, releases importer state, drops the dma-buf reference, and frees the context. |
+
+This makes revocation stronger than the original two-stage dynamic-importer
+contract for this importer: when the invalidation callback returns, no old map
+is published or usable, including for speculative read-and-discard access.
+
 ## Why this design is difficult
 
 DMA fences are a global dependency mechanism.  Once a fence is visible in a
@@ -83,3 +103,4 @@ Brost after v5 had been posted.
 - `drivers/dma-buf/dma-buf.c`: locking convention and
   `dma_buf_invalidate_mappings()` contract.
 - `drivers/dma-buf/dma-fence.c`: signalling critical-path rules.
+- Proposed fix: `0001-dma-buf-synchronously-drain-file-I-O-maps-on-invalid.patch`.
