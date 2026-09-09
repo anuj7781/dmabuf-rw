@@ -1,7 +1,7 @@
-From 09704bb3bd95669f8657e4309080e42fc4867baf Mon Sep 17 00:00:00 2001
+From c4a58d2d5007f94a37d2187e631bbe2ede55f0df Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj1072538@gmail.com>
 Date: Tue, 8 Sep 2026 16:03:23 +0530
-Subject: [PATCH 3/3] dma-buf, io_uring: fix ctx UAF and stale-map reuse found
+Subject: [PATCH 3/5] dma-buf, io_uring: fix ctx UAF and stale-map reuse found
  in review
 
 Two P1-severity issues found by an independent review of the previous
@@ -86,6 +86,8 @@ Also: after dropping a stale req->dmabuf_map, clear the field to NULL
 as well as the flag. Not required for safety (every reader already
 gates on REQ_F_DROP_DMABUF), just removes a dangling pointer that
 outlives its meaning.
+
+Signed-off-by: Anuj Gupta <anuj1072538@gmail.com>
 ---
  drivers/dma-buf/dma-buf-io.c | 79 ++++++++++++++++++++++++++++++++----
  io_uring/rsrc.c              | 43 +++++++++++++++++++-

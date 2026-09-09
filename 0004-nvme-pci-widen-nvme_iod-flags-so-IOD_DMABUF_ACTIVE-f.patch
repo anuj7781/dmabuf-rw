@@ -1,0 +1,88 @@
+From 05c2b6f189451d899ff12fdc3f3c901b8a0075b8 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj1072538@gmail.com>
+Date: Wed, 9 Sep 2026 22:23:11 +0530
+Subject: [PATCH 4/5] nvme-pci: widen nvme_iod::flags so IOD_DMABUF_ACTIVE fits
+
+IOD_DMABUF_ACTIVE is defined as 1U << 8, but struct nvme_iod declares
+flags as u8. The bit does not fit, so
+
+	iod->flags |= IOD_DMABUF_ACTIVE;
+
+truncates to a no-op with no compiler diagnostic -- not even under W=1,
+since the enum constant is int and the compound assignment narrows
+implicitly.
+
+The consequences are not cosmetic:
+
+  - nvme_dmabuf_put_active() opens with
+	if (!(iod->flags & IOD_DMABUF_ACTIVE))
+		return;
+    which now always takes the early return, so every successful
+    dma_buf_io_map_active_tryget() leaks its active reference.
+
+  - map->active therefore never drops to zero, the percpu_ref release
+    callback never runs, the drain fence never signals, and exporter
+    invalidation blocks forever. The whole point of the fenced
+    revocation path is defeated by a type width.
+
+  - nvme_req_dmabuf_map()'s WARN_ON_ONCE(!(iod->flags &
+    IOD_DMABUF_ACTIVE)) fires on the first dma-buf I/O.
+
+Widen flags to u16 and, so this cannot silently regress again, add an
+IOD_FLAGS_LAST sentinel to enum nvme_iod_flags and assert at build time
+in nvme_dmabuf_tryget_active() that the highest defined flag fits in the
+field. Any future flag added past the field width now breaks the build
+instead of disabling the reference counting.
+
+Signed-off-by: Anuj Gupta <anuj1072538@gmail.com>
+---
+ drivers/nvme/host/pci.c | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index ccede53171d5..62508f6494ab 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -516,6 +516,9 @@ enum nvme_iod_flags {
+ 	 * struct dma_buf_io_map::active in include/linux/dma-buf-io.h.
+ 	 */
+ 	IOD_DMABUF_ACTIVE	= 1U << 8,
++
++	/* Sentinel: keep last. Guards the width of nvme_iod::flags. */
++	IOD_FLAGS_LAST,
+ };
+ 
+ struct nvme_dma_vec {
+@@ -529,7 +532,13 @@ struct nvme_dma_vec {
+ struct nvme_iod {
+ 	struct nvme_request req;
+ 	struct nvme_command cmd;
+-	u8 flags;
++	/*
++	 * Wide enough for every bit in enum nvme_iod_flags. A too-narrow
++	 * type silently truncates |= stores with no compiler diagnostic
++	 * (not even under W=1), so the width is asserted at build time in
++	 * nvme_dmabuf_tryget_active().
++	 */
++	u16 flags;
+ 	u8 nr_descriptors;
+ 
+ 	size_t total_len;
+@@ -1001,6 +1010,14 @@ static bool nvme_dmabuf_tryget_active(struct request *req)
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 
++	/*
++	 * A |= of a bit that does not fit in iod->flags truncates silently,
++	 * which would make nvme_dmabuf_put_active() a permanent no-op and
++	 * leak every active reference -- the drain fence would then never
++	 * signal and invalidation would hang forever. Catch it at build time.
++	 */
++	BUILD_BUG_ON((IOD_FLAGS_LAST - 1) > (typeof(iod->flags))~0U);
++
+ 	if (WARN_ON_ONCE(iod->flags & IOD_DMABUF_ACTIVE))
+ 		return true;
+ 
+-- 
+2.43.0
+

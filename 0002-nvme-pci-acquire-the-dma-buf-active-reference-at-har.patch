@@ -1,7 +1,7 @@
-From 7b0af7de4d18df26c2fcf874587f83d57eafbd80 Mon Sep 17 00:00:00 2001
+From 0d22f491dff3b519a2f4fe6bd513d4d1c7e713a9 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj1072538@gmail.com>
 Date: Tue, 8 Sep 2026 15:14:03 +0530
-Subject: [PATCH 2/3] nvme-pci: acquire the dma-buf active reference at
+Subject: [PATCH 2/5] nvme-pci: acquire the dma-buf active reference at
  hardware submission
 
 Wire NVMe into the map->active reference from the previous commit,
@@ -71,6 +71,8 @@ that was only partially submitted.
 Also add the driver's ->free_map() implementation the previous commit's
 RCU-deferred destruction requires: a plain kfree() of the container,
 run from an RCU callback with no ctx/attach/dmabuf access.
+
+Signed-off-by: Anuj Gupta <anuj1072538@gmail.com>
 ---
  drivers/nvme/host/pci.c | 207 +++++++++++++++++++++++++++++++++++++---
  1 file changed, 193 insertions(+), 14 deletions(-)

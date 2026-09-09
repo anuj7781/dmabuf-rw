@@ -1,0 +1,431 @@
+From 8974acc1dea118920ecf8bae01b00a50a96f1b2e Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj1072538@gmail.com>
+Date: Wed, 9 Sep 2026 22:23:32 +0530
+Subject: [PATCH 5/5] dma-buf: fix ctx teardown races and honour the
+ wait-under-resv rule
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Six defects in the file I/O map/ctx lifetime, all found in review of the
+preceding two patches.
+
+1. ctx->release_work was used for two different callbacks. Both
+   dma_buf_io_ctx_release() and every "last ctx reference dropped" site
+   did INIT_WORK() on the same work_struct, the latter while
+   dma_buf_io_ctx_release_work() could still be executing on it: the
+   last map's unmap worker can drop the final ctx reference during the
+   window between that function's refcount_dec_and_test() and its
+   return. Re-initialising a running work item corrupts the workqueue's
+   view of it.
+
+   Give ctx a separate ->destroy_work, initialise both exactly once in
+   dma_buf_io_ctx_create(), and never re-initialise either. All the
+   open-coded "dec and maybe queue" sites collapse into
+   dma_buf_io_ctx_put(), which always defers the free -- callers may
+   hold dma_resv, which ->release() -> dma_buf_detach() takes as well.
+
+2. The target file was not pinned by the ctx. The importer fput()s it
+   immediately on release, but teardown is asynchronous and calls back
+   into that file's driver via ->release() -> dma_buf_detach(). Take a
+   reference in dma_buf_io_ctx_create() and drop it in
+   dma_buf_io_ctx_destroy() after the detach, from a local copy since
+   kfree(ctx) may free the importer struct that also holds the pointer.
+
+3. percpu_ref_exit() ran at unmap time, while the ref was still
+   reachable. Its documented contract is that the ref is "no longer in
+   active use", which is exactly what the kref/active split makes
+   untrue: a software kref holder may sit in the block layer across a
+   whole invalidation and then call dma_buf_io_map_active_tryget().
+   That happens to be benign today only because __percpu_ref_exit()
+   leaves __PERCPU_REF_DEAD set in percpu_count_ptr, an implementation
+   detail. Move it to the RCU free callback, where no kref holder can
+   remain by construction, and document that ->free_map() is handed an
+   already-exited ref.
+
+4. dma_buf_io_create_map() waited for fences before taking the
+   reservation lock, then re-checked with a zero timeout and dropped
+   the lock to retry. Christian König NAK'd precisely this on v4:
+
+     "Clear NAK to that. Always wait while holding the resv lock if you
+      can! It is absolutely not beneficial to do this outside of the
+      lock and usually just hides problems instead and prevent fixing
+      them."
+
+   Lock, check the cache, then wait under the lock. The unlock/retry
+   loop and the window where the fence set could change between the
+   wait and the map both disappear.
+
+5. dma_buf_io_ctx_release_work() returned early on two WARN_ON_ONCE()
+   conditions, skipping the final decrement and permanently leaking
+   ctx, its dma_buf reference, the driver attachment and now the file.
+   Warn, then drop the reference regardless; if a map somehow survived,
+   its own ctx pin keeps ctx alive anyway.
+
+6. Annotate dma_buf_io_map_active_release() with
+   dma_fence_begin_signalling()/dma_fence_end_signalling(). The
+   load-bearing claim of this design is that the window from fence
+   publication to fence signal allocates nothing and takes no lock
+   reclaim can wait on. That claim was previously made only in comments;
+   now lockdep checks it on every boot with CONFIG_PROVE_LOCKING,
+   including on the paths nobody thought to test.
+
+Signed-off-by: Anuj Gupta <anuj1072538@gmail.com>
+---
+ drivers/dma-buf/dma-buf-io.c | 170 ++++++++++++++++++++++++-----------
+ include/linux/dma-buf-io.h   |  22 ++++-
+ 2 files changed, 137 insertions(+), 55 deletions(-)
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index 0b921833431a..2ef9265ec339 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -20,6 +20,7 @@
+  */
+ #include <linux/dma-buf-io.h>
+ #include <linux/dma-resv.h>
++#include <linux/file.h>
+ 
+ struct dma_buf_io_fence {
+ 	struct dma_fence base;
+@@ -52,10 +53,9 @@ static const struct dma_fence_ops dma_buf_io_fence_ops = {
+ 	.get_timeline_name = dma_buf_io_fence_timeline_name,
+ };
+ 
+-static void dma_buf_io_ctx_destroy_work(struct work_struct *work)
++static void dma_buf_io_ctx_destroy(struct dma_buf_io_ctx *ctx)
+ {
+-	struct dma_buf_io_ctx *ctx = container_of(work, struct dma_buf_io_ctx,
+-						  release_work);
++	struct file *file = ctx->file;
+ 
+ 	if (WARN_ON_ONCE(refcount_read(&ctx->refs)))
+ 		return;
+@@ -63,6 +63,29 @@ static void dma_buf_io_ctx_destroy_work(struct work_struct *work)
+ 	ctx->dev_ops->release(ctx);
+ 	dma_buf_put(ctx->dmabuf);
+ 	kfree(ctx);
++	/*
++	 * Dropped last: the driver state this file pins must outlive
++	 * ->release()'s detach, and ctx may be embedded in an importer
++	 * struct that kfree(ctx) just freed -- hence the local copy.
++	 */
++	fput(file);
++}
++
++static void dma_buf_io_ctx_destroy_work(struct work_struct *work)
++{
++	dma_buf_io_ctx_destroy(container_of(work, struct dma_buf_io_ctx,
++					    destroy_work));
++}
++
++/*
++ * Drop a ctx reference, deferring destruction to a worker. Callers may hold
++ * dma_resv, which ctx->dev_ops->release() -> dma_buf_detach() takes as well,
++ * so the final free must never run inline from here.
++ */
++static void dma_buf_io_ctx_put(struct dma_buf_io_ctx *ctx)
++{
++	if (refcount_dec_and_test(&ctx->refs))
++		queue_work(system_wq, &ctx->destroy_work);
+ }
+ 
+ /*
+@@ -76,6 +99,18 @@ static void dma_buf_io_map_free_rcu(struct rcu_head *rcu)
+ {
+ 	struct dma_buf_io_map *map = container_of(rcu, struct dma_buf_io_map, rcu);
+ 
++	/*
++	 * percpu_ref_exit()'s contract is that the ref is "no longer in
++	 * active use". Only here is that actually true: a software kref
++	 * holder is allowed to sit in the block layer across an entire
++	 * invalidation and then call dma_buf_io_map_active_tryget(), so
++	 * exiting the ref at unmap time -- while krefs remain -- would be a
++	 * tryget on a torn-down percpu_ref. It happens to be benign today
++	 * only because __percpu_ref_exit() leaves __PERCPU_REF_DEAD set in
++	 * percpu_count_ptr, which is an implementation detail, not a
++	 * guarantee.
++	 */
++	percpu_ref_exit(&map->active);
+ 	map->dev_ops->free_map(map);
+ }
+ 
+@@ -110,19 +145,16 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ 	dma_resv_unlock(dmabuf->resv);
+ 
+ 	dma_fence_put(&map->fence->base);
+-	percpu_ref_exit(&map->active);
+-	/* Drop the ctx's own (publication-time) software reference. */
++	map->fence = NULL;
++	/*
++	 * Drop the ctx's own (publication-time) software reference.
++	 * percpu_ref_exit() deliberately does not happen here; see
++	 * dma_buf_io_map_free_rcu().
++	 */
+ 	kref_put(&map->refs, __dma_buf_io_map_free);
+ 
+ 	/* Drop this map's pin on ctx, taken in dma_buf_io_init_map(). */
+-	if (refcount_dec_and_test(&ctx->refs)) {
+-		/*
+-		 * Destruction needs to wait for I/O and dma fences. Defer it to
+-		 * simplify locking.
+-		 */
+-		INIT_WORK(&ctx->release_work, dma_buf_io_ctx_destroy_work);
+-		queue_work(system_wq, &ctx->release_work);
+-	}
++	dma_buf_io_ctx_put(ctx);
+ }
+ 
+ /*
+@@ -133,6 +165,16 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ {
+ 	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
++	bool cookie;
++
++	/*
++	 * The load-bearing claim of this design is that the window from
++	 * fence publication to fence signal performs no allocation and takes
++	 * no lock that memory reclaim can wait on. Annotate it so lockdep
++	 * proves that on every boot with CONFIG_PROVE_LOCKING, including on
++	 * the paths nobody thought to test (timeout, abort, reset).
++	 */
++	cookie = dma_fence_begin_signalling();
+ 
+ 	switch (map->release_mode) {
+ 	case DMA_BUF_IO_RELEASE_SYNC:
+@@ -142,7 +184,7 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ 		 * published for this generation.
+ 		 */
+ 		complete(&map->drain);
+-		return;
++		break;
+ 	case DMA_BUF_IO_RELEASE_FENCED:
+ 	default:
+ 		/*
+@@ -154,7 +196,10 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ 		 */
+ 		dma_fence_signal(&map->fence->base);
+ 		queue_work(dma_buf_io_wq, &map->release_work);
++		break;
+ 	}
++
++	dma_fence_end_signalling(cookie);
+ }
+ 
+ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+@@ -216,19 +261,21 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 	struct dma_buf_io_map *map;
+ 	long ret;
+ 
+-retry:
+ 	/*
+-	 * ->dmabuf_map() will be calling dma_buf_map_attachment(), for which
+-	 * we'll need to wait for fences. Do a bit nicer and try to wait
+-	 * without the resv lock first.
++	 * Lock first, then wait. An earlier version tried to be clever and
++	 * pre-waited without the reservation lock, then re-checked with a
++	 * zero timeout and dropped the lock to retry on failure. Christian
++	 * König NAK'd exactly that on v4:
++	 *
++	 *   "Clear NAK to that. Always wait while holding the resv lock if
++	 *    you can! It is absolutely not beneficial to do this outside of
++	 *    the lock and usually just hides problems instead and prevent
++	 *    fixing them."
++	 *
++	 * Waiting under the lock is explicitly permitted by dma_resv, and it
++	 * removes the unlock/retry loop along with the window in which the
++	 * fence set could change between the wait and the map.
+ 	 */
+-	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
+-				    true, MAX_SCHEDULE_TIMEOUT);
+-	if (!ret)
+-		ret = -EAGAIN;
+-	if (ret < 0)
+-		return ERR_PTR(ret);
+-
+ 	ret = dma_resv_lock_interruptible(dmabuf->resv, NULL);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+@@ -239,11 +286,16 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 		goto out;
+ 	}
+ 
+-	if (dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
+-				  true, 0) <= 0) {
+-		dma_resv_unlock(dmabuf->resv);
+-		goto retry;
+-	}
++	/*
++	 * ->map() will call dma_buf_map_attachment(), which requires the
++	 * exporter's outstanding fences to have retired first.
++	 */
++	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL, true,
++				    MAX_SCHEDULE_TIMEOUT);
++	if (ret == 0)
++		ret = -ETIMEDOUT;
++	if (ret < 0)
++		goto out;
+ 
+ 	map = ctx->dev_ops->map(ctx);
+ 	if (IS_ERR(map)) {
+@@ -263,13 +315,11 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 		 * needed.
+ 		 */
+ 		ctx->dev_ops->unmap(ctx, map);
+-		percpu_ref_exit(&map->active);
++		/* Never dma_fence_init()'d on this path; plain kfree. */
+ 		kfree(map->fence);
++		map->fence = NULL;
+ 		kref_put(&map->refs, __dma_buf_io_map_free);
+-		if (refcount_dec_and_test(&ctx->refs)) {
+-			INIT_WORK(&ctx->release_work, dma_buf_io_ctx_destroy_work);
+-			queue_work(system_wq, &ctx->release_work);
+-		}
++		dma_buf_io_ctx_put(ctx);
+ 		ret = -EFAULT;
+ 		goto out;
+ 	}
+@@ -320,22 +370,15 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 		/* Never dma_fence_init()'d on this path; plain kfree. */
+ 		kfree(map->fence);
+ 		map->fence = NULL;
+-		percpu_ref_exit(&map->active);
+ 		kref_put(&map->refs, __dma_buf_io_map_free);
+ 
+ 		/*
+ 		 * Drop this map's pin on ctx (taken in dma_buf_io_init_map()).
+-		 * dma_resv is held here (this function's own contract), and
+-		 * ctx->dev_ops->release() -> dma_buf_detach() is expected to
+-		 * take it too, so a same-context ctx destruction must be
+-		 * deferred, not called inline -- mirrors
+-		 * dma_buf_io_map_release_work(), which only reaches the
+-		 * equivalent decrement after unlocking.
++		 * dma_buf_io_ctx_put() always defers the free, which matters
++		 * here: dma_resv is held (this function's own contract) and
++		 * ctx->dev_ops->release() -> dma_buf_detach() takes it too.
+ 		 */
+-		if (refcount_dec_and_test(&ctx->refs)) {
+-			INIT_WORK(&ctx->release_work, dma_buf_io_ctx_destroy_work);
+-			queue_work(system_wq, &ctx->release_work);
+-		}
++		dma_buf_io_ctx_put(ctx);
+ 		return;
+ 	}
+ 
+@@ -385,22 +428,29 @@ static void dma_buf_io_ctx_release_work(struct work_struct *work)
+ 	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
+ 				    false, MAX_SCHEDULE_TIMEOUT);
+ 
+-	if (WARN_ON_ONCE(ret <= 0))
+-		return;
+-	if (WARN_ON_ONCE(rcu_dereference_protected(ctx->map, true)))
+-		return;
++	/*
++	 * Both of these are "cannot happen" conditions, but an early return
++	 * here would skip the decrement below and permanently leak ctx, the
++	 * dma_buf reference it holds, the driver attachment, and the target
++	 * file. Warn and still drop the reference: if a map somehow survived,
++	 * its own ctx pin keeps ctx alive and the free is deferred to
++	 * whichever path releases it last.
++	 */
++	WARN_ON_ONCE(ret <= 0);
++	WARN_ON_ONCE(rcu_dereference_protected(ctx->map, true));
+ 
+-	if (refcount_dec_and_test(&ctx->refs))
+-		dma_buf_io_ctx_destroy_work(&ctx->release_work);
++	dma_buf_io_ctx_put(ctx);
+ }
+ 
+ void dma_buf_io_ctx_release(struct dma_buf_io_ctx *ctx)
+ {
+ 	/*
+ 	 * Destruction needs to wait for I/O and dma fences. Defer it to
+-	 * simplify locking.
++	 * simplify locking. Both work items were initialised once in
++	 * dma_buf_io_ctx_create() and are never re-initialised: this one can
++	 * still be running when the last map's unmap worker drops the final
++	 * ctx reference and queues ->destroy_work.
+ 	 */
+-	INIT_WORK(&ctx->release_work, dma_buf_io_ctx_release_work);
+ 	queue_work(system_wq, &ctx->release_work);
+ }
+ EXPORT_SYMBOL_NS_GPL(dma_buf_io_ctx_release, "DMA_BUF");
+@@ -420,12 +470,23 @@ int dma_buf_io_ctx_create(struct file *file,
+ 	ctx->dir = dir;
+ 	ctx->dmabuf = dmabuf;
+ 	refcount_set(&ctx->refs, 1);
++	INIT_WORK(&ctx->release_work, dma_buf_io_ctx_release_work);
++	INIT_WORK(&ctx->destroy_work, dma_buf_io_ctx_destroy_work);
+ 	get_dma_buf(dmabuf);
++	/*
++	 * ctx teardown is asynchronous and calls back into the driver behind
++	 * @file (->release() -> dma_buf_detach()), which can run long after
++	 * the importer has dropped its own reference to @file. Hold one of
++	 * our own for the ctx's lifetime rather than depending on the
++	 * importer's.
++	 */
++	ctx->file = get_file(file);
+ 
+ 	ret = file->f_op->init_dma_buf_io_ctx(file, ctx);
+ 	if (ret) {
+ 		memset(ctx, 0, sizeof(*ctx));
+ 		dma_buf_put(dmabuf);
++		fput(file);
+ 		return ret;
+ 	}
+ 
+@@ -446,6 +507,7 @@ int dma_buf_io_ctx_create(struct file *file,
+ 			ctx->dev_ops->release(ctx);
+ 		memset(ctx, 0, sizeof(*ctx));
+ 		dma_buf_put(dmabuf);
++		fput(file);
+ 		return -EINVAL;
+ 	}
+ 
+diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
+index 504b7d33c03f..e5edb19f2126 100644
+--- a/include/linux/dma-buf-io.h
++++ b/include/linux/dma-buf-io.h
+@@ -49,7 +49,8 @@ struct dma_buf_io_ops {
+ 	 * Free the driver's container of @map after an RCU grace period.
+ 	 * @map is the first member of the driver's container struct; the
+ 	 * driver must free that container, not just @map itself. Called
+-	 * from an RCU callback: must not sleep or block.
++	 * from an RCU callback: must not sleep or block. @map->active has
++	 * already been percpu_ref_exit()'d by the caller.
+ 	 */
+ 	void (*free_map)(struct dma_buf_io_map *map);
+ };
+@@ -128,9 +129,28 @@ struct dma_buf_io_ctx {
+ 
+ 	atomic_t				fence_seq;
+ 	u64					fence_ctx;
++
++	/*
++	 * Two distinct work items, not one reused. release_work runs the
++	 * user-visible teardown (drop the last map, wait for the drain
++	 * fence); destroy_work runs the final free once ->refs hits zero.
++	 * The last map's unmap worker can reach that zero while
++	 * dma_buf_io_ctx_release_work() is still executing, so re-INIT_WORK()
++	 * on a single shared work_struct would be scribbling over a work
++	 * item that is currently running.
++	 */
+ 	struct work_struct			release_work;
++	struct work_struct			destroy_work;
+ 	refcount_t				refs;
+ 
++	/*
++	 * The target file this ctx was created against, pinned for the ctx's
++	 * whole lifetime. Teardown is asynchronous and calls back into the
++	 * driver (->release() -> dma_buf_detach()), so the importer's own
++	 * fput() must not be the only thing keeping that device alive.
++	 */
++	struct file				*file;
++
+ 	void					*dev_priv;
+ 	const struct dma_buf_io_ops		*dev_ops;
+ };
+-- 
+2.43.0
+
