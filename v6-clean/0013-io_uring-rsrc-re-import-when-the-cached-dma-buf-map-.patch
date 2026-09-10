@@ -1,4 +1,4 @@
-From 490276c866f013751cdff3d8548929ee2c81dd22 Mon Sep 17 00:00:00 2001
+From 98e3848f9bd2c7ed2c2a98b98c76099e9273e0ba Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:41:20 +0530
 Subject: [PATCH 13/17] io_uring/rsrc: re-import when the cached dma-buf map is

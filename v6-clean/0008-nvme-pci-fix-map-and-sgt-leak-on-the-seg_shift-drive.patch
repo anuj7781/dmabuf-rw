@@ -1,7 +1,7 @@
-From 96ffc0f471a4cceb8963adc1d3f6e33796656a42 Mon Sep 17 00:00:00 2001
+From 8188d172efc7b4ca0b598eda3decac70c920ef36 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:33:09 +0530
-Subject: [PATCH 09/17] nvme-pci: fix map and sgt leak on the seg_shift
+Subject: [PATCH 08/17] nvme-pci: fix map and sgt leak on the seg_shift
  driver-bug path
 
 nvme_dma_buf_io_map(), added by patch 11 of "Add dmabuf read/write via

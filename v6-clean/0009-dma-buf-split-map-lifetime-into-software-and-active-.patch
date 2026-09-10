@@ -1,7 +1,7 @@
-From eef6ed2ccea6915f0cb1af55f47ab0e4a653440e Mon Sep 17 00:00:00 2001
+From 77414fbe39d25055030f2e1dae290b4a6159f03c Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:35:57 +0530
-Subject: [PATCH 10/17] dma-buf: split map lifetime into software and active
+Subject: [PATCH 09/17] dma-buf: split map lifetime into software and active
  references
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -60,7 +60,7 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  3 files changed, 162 insertions(+), 22 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index ddcd653678fe..0d6574270737 100644
+index ef6e665d3558..dd80bc9eea03 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
 @@ -54,6 +54,28 @@ static void dma_buf_io_ctx_put(struct dma_buf_io_ctx *ctx)
@@ -212,7 +212,7 @@ index ddcd653678fe..0d6574270737 100644
  }
  
  void dma_buf_io_invalidate_mappings(struct dma_buf_io_ctx *ctx)
-@@ -292,7 +344,8 @@ int dma_buf_io_ctx_create(struct file *file,
+@@ -288,7 +340,8 @@ int dma_buf_io_ctx_create(struct file *file,
  	if (WARN_ON_ONCE(!ctx->dev_ops ||
  			 !ctx->dev_ops->map ||
  			 !ctx->dev_ops->unmap ||

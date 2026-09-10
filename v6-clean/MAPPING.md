@@ -21,9 +21,9 @@ head (`71c75106fd3c`) rather than on old commit 1:
 | 5 | `dma-buf: do not leak the dma_buf on the incomplete-ops path` | new -- v5 bug found while rewriting commit 5's territory: the ops-completeness check leaked the dma_buf reference |
 | 6 | `dma-buf: use separate work items for ctx release and destroy` | 3 (the `ctx->release_work` reinit-while-running half) |
 | 7 | `dma-buf: pin the target file for the ctx lifetime` | 3 (the `fput()`-before-teardown half) |
-| 8 | `dma-buf: do not leak ctx on ctx_release_work's WARN_ON_ONCE paths` | 3 (the teardown-WARN leak half) |
-| 9 | `nvme-pci: fix map and sgt leak on the seg_shift driver-bug path` | new -- v5 bug found while rewriting commit 2's territory: nvme's `->map()` had the same missing-unwind shape as commit 3 above |
-| 10 | `dma-buf: split map lifetime into software and active references` | 1 (kref/active split, RCU free, cached `dev_ops`, per-map ctx pin -- **without** the fence-ordering or workqueue changes 1 originally bundled) |
+| 8 | `nvme-pci: fix map and sgt leak on the seg_shift driver-bug path` | new -- v5 bug found while rewriting commit 2's territory: nvme's `->map()` had the same missing-unwind shape as commit 3 above |
+| 9 | `dma-buf: split map lifetime into software and active references` | 1 (kref/active split, RCU free, cached `dev_ops`, per-map ctx pin -- **without** the fence-ordering or workqueue changes 1 originally bundled) |
+| 10 | `dma-buf: do not leak ctx on ctx_release_work's WARN_ON_ONCE paths` | 3 (the teardown-WARN leak half) -- **moved to after commit 9**; see below |
 | 11 | `dma-buf: initialise the drain fence after reserving its slot` | 1 (the fence-ordering half: `dma_fence_init()` moved past `dma_resv_reserve_fences()`, `release_mode`, the sync-drain fallback, and the signal moved out of the worker) |
 | 12 | `dma-buf: run deferred unmap on a WQ_MEM_RECLAIM workqueue` | 1 (the dedicated workqueue half, landed *after* 11 -- the original commit's title claimed this made signalling safe, which was never true; that is commit 11's doing) |
 | 13 | `io_uring/rsrc: re-import when the cached dma-buf map is stale` | 3 (the `io_dmabuf_reuse_map()` half) |
@@ -40,6 +40,38 @@ head (`71c75106fd3c`) rather than on old commit 1:
   standalone "widen" commit to fix -- the field is declared `u16` in the same
   commit that introduces the bit needing it.
 
+## Ordering fix: commit 10 was originally placed before commit 9
+
+First draft of this series placed the ctx-teardown WARN-leak fix (now
+commit 10) at position 8, grouped with the other ctx-lifetime-hardening
+commits (6, 7), *before* the map-lifetime split (commit 9). That was wrong,
+caught by review (Codex), not by the build or checkpatch.
+
+`dma_buf_io_ctx_release_work()`'s fix unconditionally falls through to
+`dma_buf_io_ctx_put(ctx)` even when its two `WARN_ON_ONCE` checks fire. One
+of those checks, `ctx->map` still being non-NULL, is genuinely reachable:
+nothing marks `ctx` as closing to new imports, so a concurrent
+`dma_buf_io_create_map()` can republish a fresh map between `drop_map()`'s
+unlock and the wait returning. Falling through safely in that case depends
+on the live map holding its own pin on `ctx` -- `dma_buf_io_init_map()`'s
+unconditional `refcount_inc(&ctx->refs)`, dropped only by the map's own
+active-release worker after it finishes unmap. That pin is introduced by
+commit 9, not commit 10 itself. At position 8 (before commit 9 existed),
+falling through to `dma_buf_io_ctx_put()` when a map is still present could
+destroy `ctx` while that map's worker still needs it -- the exact
+use-after-free class this whole series exists to eliminate, reintroduced
+into an intermediate commit by the reordering exercise itself.
+
+Fixed by moving the commit to position 10, immediately after the split
+(commit 9), and rewriting its message to state the dependency explicitly
+rather than assert "cannot happen" without the invariant that makes it
+true. See commit 10's message for the full reasoning, including the proof
+that the *other* `WARN_ON_ONCE` (`ret <= 0`) is unreachable for this
+series' own fence regardless of ordering (`dma_resv_wait_timeout()` is
+called with `intr=false` and `timeout=MAX_SCHEDULE_TIMEOUT`, and the fence
+never implements a custom `->wait`, so `dma_fence_default_wait()` cannot
+return before the fence signals).
+
 ## Known divergence from the old branch (intentional)
 
 New commit 14 removes the import-time `percpu_ref_get()`/`tryget()` calls
@@ -53,9 +85,9 @@ per-commit equivalence review of this rewrite, not before.
 ## Verification
 
 - All 17 commits build clean at `W=1` (`drivers/dma-buf/dma-buf-io.o`,
-  `drivers/nvme/host/pci.o`, `io_uring/rsrc.o`), verified individually via
-  `git rebase --exec`.
-- All 17 commits pass `checkpatch.pl --strict` with 0 errors/warnings/checks.
+  `drivers/nvme/host/pci.o`, `io_uring/rsrc.o`) and pass
+  `checkpatch.pl --strict` with 0 errors/warnings/checks, re-run after the
+  commit-10 reorder above.
 - `drivers/dma-buf/dma-buf-io.c` at the tip of `anuj/dmabuf-v6-clean` is
   functionally equivalent to the tip of `anuj/dmabuf-v6-lifetime`: every
   textual difference is comment rewording, a harmless redundant `= NULL`

@@ -1,4 +1,4 @@
-From a39595d8097f5e263dc82b516977e392ed3838ae Mon Sep 17 00:00:00 2001
+From 441a6ecb8c6fe50f413600e1184445f87c030563 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:49:32 +0530
 Subject: [PATCH 15/17] nvme-pci: end terminal dma-buf failures instead of
