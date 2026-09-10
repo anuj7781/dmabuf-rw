@@ -1,0 +1,261 @@
+From 8685ec16608179e296bb379c95d9598ebf497d82 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 15:39:09 +0530
+Subject: [PATCH 11/17] dma-buf: initialise the drain fence after reserving its
+ slot
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Christian König's review of patch 1 of "Add dmabuf read/write via
+io_uring" laid out the ordering a dma_fence backend must follow:
+
+  1. Allocate your operation object (here, the map).
+  2. Prepare your operation, including all memory allocations.
+  3. Call dma_resv_reserve_fences() to reserve a fence slot.
+  4. Allocate and init your dma_fence object. After this step no memory
+     allocation is allowed any more until your dma_fence object signals.
+  5. dma_resv_add_fence() to publish the fence.
+  6. dma_resv_unlock().
+
+v5 violates step 3 -> step 4: dma_fence_init() runs in
+dma_buf_io_init_map(), at map *creation* time, while
+dma_resv_reserve_fences() runs much later, in dma_buf_io_drop_map(), at
+invalidation time. The fence exists and can be waited on before the slot
+that is supposed to hold it has even been reserved.
+
+Move dma_fence_init() into dma_buf_io_drop_map(), after
+dma_resv_reserve_fences() succeeds. dma_buf_io_init_map() now only
+kzalloc's the fence's backing memory (step 2); it is not a valid
+dma_fence until drop_map() initialises it.
+
+This forces a second change: dma_resv_reserve_fences() can fail (e.g.
+under memory pressure), and v5 handled that by killing map->refs and
+waiting on the fence that had already been created at map-creation time
+-- impossible now that the fence isn't initialised until the reservation
+succeeds. Record which path the active-ref release callback should take,
+in the map itself, before calling percpu_ref_kill() (the callback can
+run as soon as the kill happens, from any context):
+
+  - DMA_BUF_IO_RELEASE_FENCED: the normal case. Signal the (now properly
+    ordered) fence and defer unmap to a worker, as before.
+  - DMA_BUF_IO_RELEASE_SYNC: dma_resv_reserve_fences() failed. No fence
+    was ever initialised, so there is nothing to signal or wait on.
+    Complete a plain drain completion instead; the invalidating caller,
+    still holding dma_resv, unmaps synchronously itself once active
+    drains. This cannot deadlock the way waiting on a stuck fence could,
+    because map->active's release path allocates nothing and takes no
+    lock.
+
+While here, move the fence signal itself out of the unmap worker and
+into the active-release callback, right where FENCED is decided. v5's
+comment justified signalling before taking the resv lock ("someone could
+be waiting for the fence while holding the lock") -- that reasoning does
+not actually require signalling from the worker; the callback is exactly
+as good a place, requires no dma_resv access, and keeps "what to do to
+signal" and "which mode to signal in" next to each other instead of
+split across two functions.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ drivers/dma-buf/dma-buf-io.c | 94 +++++++++++++++++++++++++++---------
+ include/linux/dma-buf-io.h   | 20 ++++++++
+ 2 files changed, 92 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index 0d6574270737..181eb5a47c05 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -87,16 +87,9 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ 	/*
+ 	 * ctx is guaranteed alive here: dma_buf_io_init_map() pinned it for
+ 	 * this map's entire lifetime, and that pin is only dropped below,
+-	 * after unmap.
++	 * after unmap. The fence was already signalled from the active-ref
++	 * release callback before this worker was even queued.
+ 	 */
+-
+-	/*
+-	 * There are no more requests using the map, we can signal the fence.
+-	 * It should be done before taking the resv lock as someone could be
+-	 * waiting for the fence while holding the lock.
+-	 */
+-	dma_fence_signal(fence);
+-
+ 	dma_resv_lock(dmabuf->resv, NULL);
+ 	ctx->dev_ops->unmap(ctx, map);
+ 	dma_resv_unlock(dmabuf->resv);
+@@ -110,13 +103,36 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ 	dma_buf_io_ctx_put(ctx);
+ }
+ 
++/*
++ * percpu_ref release callback for map->active: runs once the last hardware
++ * user is gone. May run from arbitrary context -- must not sleep, allocate,
++ * or take dma_resv.
++ */
+ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ {
+ 	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
+ 
+-	/* might sleep, use a worker */
+-	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
+-	queue_work(system_wq, &map->release_work);
++	switch (map->release_mode) {
++	case DMA_BUF_IO_RELEASE_SYNC:
++		/*
++		 * The invalidating caller is waiting on ->drain under
++		 * dma_resv and will perform unmap itself. No fence was
++		 * published for this generation.
++		 */
++		complete(&map->drain);
++		return;
++	case DMA_BUF_IO_RELEASE_FENCED:
++	default:
++		/*
++		 * There are no more requests using the map: signal the fence.
++		 * Safe from any context -- takes no lock, allocates nothing.
++		 * Unmap is deferred to a worker since it needs dma_resv, a
++		 * sleeping lock.
++		 */
++		dma_fence_signal(map->fence);
++		INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
++		queue_work(system_wq, &map->release_work);
++	}
+ }
+ 
+ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+@@ -135,12 +151,19 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+ 		return ret;
+ 	}
+ 
+-	dma_fence_init(fence, &dma_buf_io_fence_ops, NULL, ctx->fence_ctx,
+-		       atomic_inc_return(&ctx->fence_seq));
++	/*
++	 * Only the fence's backing memory is allocated here. dma_fence_init()
++	 * itself happens in dma_buf_io_drop_map(), after
++	 * dma_resv_reserve_fences() succeeds -- see the ordering rule there.
++	 * Initialising it earlier would violate the allocate/prepare/
++	 * reserve/init/add ordering a dma_fence backend requires.
++	 */
+ 	map->fence = fence;
+ 	map->ctx = ctx;
+ 	map->dev_ops = ctx->dev_ops;
++	map->release_mode = DMA_BUF_IO_RELEASE_FENCED;
+ 	kref_init(&map->refs);
++	init_completion(&map->drain);
+ 
+ 	/*
+ 	 * Pin ctx alive for this map's entire lifetime: the active-release
+@@ -202,7 +225,8 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 		 * yet -- it was never published to ctx->map.
+ 		 */
+ 		ctx->dev_ops->unmap(ctx, map);
+-		dma_fence_put(map->fence);
++		/* Never dma_fence_init()'d on this path; plain kfree. */
++		kfree(map->fence);
+ 		percpu_ref_exit(&map->active);
+ 		kref_put(&map->refs, __dma_buf_io_map_free);
+ 		/* Drop this map's pin on ctx, taken in dma_buf_io_init_map(). */
+@@ -246,19 +270,45 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 
+ 	ret = dma_resv_reserve_fences(dmabuf->resv, 1);
+ 	if (WARN_ON_ONCE(ret)) {
+-		struct dma_fence *fence = map->fence;
+-
+-		dma_fence_get(fence);
++		/*
++		 * No fence slot. Fall back to a synchronous drain under
++		 * dma_resv instead of publishing a fence -- map->active's
++		 * release path allocates nothing and takes no lock, so this
++		 * cannot deadlock the way waiting for a stuck fence could.
++		 */
++		map->release_mode = DMA_BUF_IO_RELEASE_SYNC;
+ 		percpu_ref_kill(&map->active);
+-		dma_fence_wait(fence, false);
+-		dma_fence_put(fence);
++		wait_for_completion(&map->drain);
++
++		ctx->dev_ops->unmap(ctx, map);
++		/* Never dma_fence_init()'d on this path; plain kfree. */
++		kfree(map->fence);
++		map->fence = NULL;
++		percpu_ref_exit(&map->active);
++		kref_put(&map->refs, __dma_buf_io_map_free);
++
++		/* Drop this map's pin on ctx, taken in dma_buf_io_init_map(). */
++		dma_buf_io_ctx_put(ctx);
+ 		return;
+ 	}
+ 
++	/*
++	 * Fence ordering rule (Christian König, v4 review): allocate ->
++	 * prepare (all allocations) -> dma_resv_reserve_fences() ->
++	 * dma_fence_init() -> dma_resv_add_fence(). No allocation is
++	 * permitted on the fence's signalling path past this point; see
++	 * dma_buf_io_map_active_release()'s FENCED branch, which only
++	 * signals and queues work.
++	 */
++	dma_fence_init(map->fence, &dma_buf_io_fence_ops, NULL, ctx->fence_ctx,
++		       atomic_inc_return(&ctx->fence_seq));
+ 	dma_resv_add_fence(dmabuf->resv, map->fence, DMA_RESV_USAGE_KERNEL);
++
++	map->release_mode = DMA_BUF_IO_RELEASE_FENCED;
+ 	/*
+-	 * Delay destruction until all inflight requests using the map are
+-	 * gone. It'll also signal the fence then.
++	 * Delay unmap until all active (hardware) users are gone. The
++	 * percpu_ref release callback signals the fence and queues the
++	 * unmap worker.
+ 	 */
+ 	percpu_ref_kill(&map->active);
+ }
+diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
+index 7570f8f38c48..74ce107aeb2a 100644
+--- a/include/linux/dma-buf-io.h
++++ b/include/linux/dma-buf-io.h
+@@ -2,6 +2,7 @@
+ #ifndef __DMA_BUF_IO_H__
+ #define __DMA_BUF_IO_H__
+ 
++#include <linux/completion.h>
+ #include <linux/dma-buf.h>
+ #include <linux/kref.h>
+ #include <linux/rcupdate.h>
+@@ -37,6 +38,22 @@ struct dma_buf_io_ops {
+ 	void (*free_map)(struct dma_buf_io_map *map);
+ };
+ 
++/*
++ * Which path the percpu_ref release callback takes when the last active
++ * reference drops. Recorded in the map *before* percpu_ref_kill() is called,
++ * because the callback can run as soon as the kill happens.
++ */
++enum dma_buf_io_release_mode {
++	/* Normal path: signal the drain fence, defer unmap to a worker. */
++	DMA_BUF_IO_RELEASE_FENCED,
++	/*
++	 * dma_resv_reserve_fences() failed during invalidation. No fence was
++	 * initialised or published; complete ->drain directly so the caller,
++	 * still holding dma_resv, can unmap synchronously.
++	 */
++	DMA_BUF_IO_RELEASE_SYNC,
++};
++
+ struct dma_buf_io_map {
+ 	/*
+ 	 * Software reference: held by every holder of a *pointer* to this
+@@ -84,7 +101,10 @@ struct dma_buf_io_map {
+ 	 */
+ 	unsigned			seg_shift;
+ 
++	enum dma_buf_io_release_mode	release_mode;
++
+ 	struct work_struct		release_work;
++	struct completion		drain;
+ 	struct dma_fence		*fence;
+ 	struct dma_buf_io_ctx		*ctx;
+ 	struct rcu_head			rcu;
+-- 
+2.43.0
+

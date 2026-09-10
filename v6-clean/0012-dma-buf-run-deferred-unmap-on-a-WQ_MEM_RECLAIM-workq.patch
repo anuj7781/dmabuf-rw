@@ -1,0 +1,85 @@
+From 9fd2df008337c5eec341870b616f12608dc03647 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 15:40:08 +0530
+Subject: [PATCH 12/17] dma-buf: run deferred unmap on a WQ_MEM_RECLAIM
+ workqueue
+
+The active-ref release callback (previous commit) queues the actual
+unmap onto system_wq. Matthew Brost, reviewing the same pattern on v4:
+
+  You can't guarantee that a GFP_KERNEL allocation won't be performed
+  from a system worker thread, so you can't safely signal a fence from
+  one.
+
+The unmap worker no longer signals the fence -- that already happens
+directly from the release callback, before this worker is even queued.
+But the worker itself is still something an exporter's reclaim/eviction
+path can be waiting on (via the drain fence, or via ->drain in the
+synchronous fallback), and system_wq gives no forward-progress guarantee
+under memory pressure: unrelated GFP_KERNEL work queued ahead of it on
+a saturated system_wq can stall it indefinitely, which stalls the
+exporter's reclaim attempt.
+
+Give it a dedicated workqueue: WQ_MEM_RECLAIM for a rescuer thread under
+memory pressure, WQ_UNBOUND since unmap work is not CPU-affine and must
+not queue up behind unrelated per-CPU bound work.
+
+This addresses workqueue starvation only. It is not, by itself, what
+makes fence signalling correct -- that is the previous commit, which
+moved the signal out of any worker entirely.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ drivers/dma-buf/dma-buf-io.c | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index 181eb5a47c05..638bd18e6749 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -8,6 +8,20 @@
+ #include <linux/dma-resv.h>
+ #include <linux/file.h>
+ 
++/*
++ * Dedicated so the unmap worker is never starved by system_wq saturation.
++ * An exporter's reclaim/eviction path can be waiting on this worker (via the
++ * drain fence or ->drain), and system_wq offers no forward-progress
++ * guarantee under memory pressure. WQ_UNBOUND: unmap work is not CPU-affine
++ * and must not queue up behind unrelated per-CPU bound work either.
++ *
++ * This addresses workqueue starvation only. It does not by itself make
++ * signalling the fence from a worker safe -- that is why the fence is
++ * signalled from dma_buf_io_map_active_release() (see the FENCED case
++ * there), not from work queued on this or any other workqueue.
++ */
++static struct workqueue_struct *dma_buf_io_wq;
++
+ static const char *dma_buf_io_fence_drv_name(struct dma_fence *fence)
+ {
+ 	return "dma-buf-io-ctx";
+@@ -131,7 +145,7 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ 		 */
+ 		dma_fence_signal(map->fence);
+ 		INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
+-		queue_work(system_wq, &map->release_work);
++		queue_work(dma_buf_io_wq, &map->release_work);
+ 	}
+ }
+ 
+@@ -413,3 +427,12 @@ int dma_buf_io_ctx_create(struct file *file,
+ 
+ 	return ret;
+ }
++
++static int __init dma_buf_io_init(void)
++{
++	dma_buf_io_wq = alloc_workqueue("dma_buf_io", WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
++	if (!dma_buf_io_wq)
++		return -ENOMEM;
++	return 0;
++}
++subsys_initcall(dma_buf_io_init);
+-- 
+2.43.0
+

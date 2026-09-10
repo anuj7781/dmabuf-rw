@@ -1,0 +1,161 @@
+From eb19ca81ca2997da1020f1e8e0806b5e6fccd9fd Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 14:51:08 +0530
+Subject: [PATCH 02/17] dma-buf: drop the dma_buf_io_fence wrapper struct
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The file I/O infrastructure added in patch 1 of "Add dmabuf read/write
+via io_uring" wraps its drain fence in
+
+	struct dma_buf_io_fence {
+		struct dma_fence base;
+		spinlock_t lock;
+	};
+
+purely to supply the spinlock. dma_fence can carry its own now:
+
+	union {
+		spinlock_t *extern_lock;
+		spinlock_t inline_lock;
+	};
+
+__dma_fence_init() takes the inline lock when passed a NULL lock pointer
+and sets DMA_FENCE_FLAG_INLINE_LOCK_BIT; the external lock is documented
+as deprecated, and the stub fence in dma-fence.c already passes NULL.
+
+So map->fence becomes a plain struct dma_fence * initialised with a NULL
+lock. This also removes
+
+	/* default fence release kfree's the base pointer */
+	BUILD_BUG_ON(offsetof(struct dma_buf_io_fence, base));
+
+which existed only to assert that the wrapper's first member was the
+fence, so that dma_fence_release()'s default dma_fence_free() ->
+kfree_rcu() freed the right pointer. With a plain allocation that holds
+by construction.
+
+No functional change.
+
+Christian König asked for this on v4 -- "Upstream has changed to allow
+embedding the spinlock into the dma_fence, so this structure here is
+most likely not necessary any more" -- and Pavel agreed at the time, but
+the change never landed in v5.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ drivers/dma-buf/dma-buf-io.c | 26 ++++++++------------------
+ include/linux/dma-buf-io.h   |  3 +--
+ 2 files changed, 9 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index 24f58f80c45c..6834a79700ce 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -7,16 +7,8 @@
+ #include <linux/dma-buf-io.h>
+ #include <linux/dma-resv.h>
+ 
+-struct dma_buf_io_fence {
+-	struct dma_fence base;
+-	spinlock_t lock;
+-};
+-
+ static const char *dma_buf_io_fence_drv_name(struct dma_fence *fence)
+ {
+-	/* default fence release kfree's the base pointer */
+-	BUILD_BUG_ON(offsetof(struct dma_buf_io_fence, base));
+-
+ 	return "dma-buf-io-ctx";
+ }
+ 
+@@ -47,7 +39,7 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ {
+ 	struct dma_buf_io_map *map = container_of(work, struct dma_buf_io_map,
+ 						  release_work);
+-	struct dma_buf_io_fence *fence = map->fence;
++	struct dma_fence *fence = map->fence;
+ 	struct dma_buf_io_ctx *ctx = map->ctx;
+ 	struct dma_buf *dmabuf = ctx->dmabuf;
+ 
+@@ -63,13 +55,13 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ 	 * It should be done before taking the resv lock as someone could be
+ 	 * waiting for the fence while holding the lock.
+ 	 */
+-	dma_fence_signal(&fence->base);
++	dma_fence_signal(fence);
+ 
+ 	dma_resv_lock(dmabuf->resv, NULL);
+ 	ctx->dev_ops->unmap(ctx, map);
+ 	dma_resv_unlock(dmabuf->resv);
+ 
+-	dma_fence_put(&fence->base);
++	dma_fence_put(fence);
+ 	percpu_ref_exit(&map->refs);
+ 	kfree(map);
+ 
+@@ -94,7 +86,7 @@ static void dma_buf_io_map_refs_release(struct percpu_ref *ref)
+ 
+ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+ {
+-	struct dma_buf_io_fence *fence = NULL;
++	struct dma_fence *fence = NULL;
+ 	int ret;
+ 
+ 	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
+@@ -107,9 +99,8 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+ 		return ret;
+ 	}
+ 
+-	spin_lock_init(&fence->lock);
+-	dma_fence_init(&fence->base, &dma_buf_io_fence_ops, &fence->lock,
+-			ctx->fence_ctx, atomic_inc_return(&ctx->fence_seq));
++	dma_fence_init(fence, &dma_buf_io_fence_ops, NULL, ctx->fence_ctx,
++		       atomic_inc_return(&ctx->fence_seq));
+ 	map->fence = fence;
+ 	map->ctx = ctx;
+ 	return 0;
+@@ -185,7 +176,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 
+ 	ret = dma_resv_reserve_fences(dmabuf->resv, 1);
+ 	if (WARN_ON_ONCE(ret)) {
+-		struct dma_fence *fence = &map->fence->base;
++		struct dma_fence *fence = map->fence;
+ 
+ 		dma_fence_get(fence);
+ 		percpu_ref_kill(&map->refs);
+@@ -194,8 +185,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 		return;
+ 	}
+ 
+-	dma_resv_add_fence(dmabuf->resv, &map->fence->base,
+-			   DMA_RESV_USAGE_KERNEL);
++	dma_resv_add_fence(dmabuf->resv, map->fence, DMA_RESV_USAGE_KERNEL);
+ 	/*
+ 	 * Delay destruction until all inflight requests using the map are
+ 	 * gone. It'll also signal the fence then.
+diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
+index d72182acf2ed..26fe4c7228eb 100644
+--- a/include/linux/dma-buf-io.h
++++ b/include/linux/dma-buf-io.h
+@@ -4,7 +4,6 @@
+ 
+ #include <linux/dma-buf.h>
+ 
+-struct dma_buf_io_fence;
+ struct dma_buf_io_ctx;
+ struct dma_buf_io_map;
+ 
+@@ -54,7 +53,7 @@ struct dma_buf_io_map {
+ 	unsigned			seg_shift;
+ 
+ 	struct work_struct		release_work;
+-	struct dma_buf_io_fence		*fence;
++	struct dma_fence		*fence;
+ 	struct dma_buf_io_ctx		*ctx;
+ };
+ 
+-- 
+2.43.0
+

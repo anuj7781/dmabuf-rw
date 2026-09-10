@@ -1,0 +1,120 @@
+From a39595d8097f5e263dc82b516977e392ed3838ae Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 15:49:32 +0530
+Subject: [PATCH 15/17] nvme-pci: end terminal dma-buf failures instead of
+ requeuing them
+
+The previous commit made a dma-buf generation-loss rejection
+(NVME_STS_DMABUF_GENERATION_LOST) a real, terminal failure returned from
+nvme_rq_setup_dmabuf() -> nvme_prep_rq(). The single-request submission
+path (nvme_queue_rq()) already handles any non-OK blk_status_t correctly
+by completing the request with it.
+
+The batch path does not. nvme_prep_rq_batch() collapses nvme_prep_rq()'s
+return to a bool:
+
+	return nvme_prep_rq(req) == BLK_STS_OK;
+
+and nvme_queue_rqs() treats every false as "try again later":
+
+	if (nvme_prep_rq_batch(nvmeq, req))
+		rq_list_add_tail(&submit_list, req);
+	else
+		rq_list_add_tail(&requeue_list, req);
+
+A generation-loss rejection is indistinguishable from a transient
+resource shortage here, so it loops through requeue_list indefinitely --
+nothing about a dead map generation changes on retry, so this is a
+livelock, not a transient stall.
+
+Return the real blk_status_t from nvme_prep_rq_batch() and branch on it
+in nvme_queue_rqs(): BLK_STS_OK submits, BLK_STS_RESOURCE and
+BLK_STS_DEV_RESOURCE requeue (the only two cases that were ever meant to
+loop), and everything else -- including
+NVME_STS_DMABUF_GENERATION_LOST -- ends the request immediately via
+blk_mq_end_request() instead of requeuing it.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ drivers/nvme/host/pci.c | 44 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 38 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 2cdd732844a3..b81ebe78db28 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1923,18 +1923,27 @@ static void nvme_submit_cmds(struct nvme_queue *nvmeq, struct rq_list *rqlist)
+ 	spin_unlock(&nvmeq->sq_lock);
+ }
+ 
+-static bool nvme_prep_rq_batch(struct nvme_queue *nvmeq, struct request *req)
++/*
++ * Returns the actual blk_status_t from nvme_prep_rq() -- previously
++ * collapsed to bool, which made every failure indistinguishable from a
++ * resource shortage and therefore always requeued. A dma-buf
++ * generation-loss rejection (NVME_STS_DMABUF_GENERATION_LOST) is terminal
++ * and must not be requeued: requeuing re-runs nvme_prep_rq() against the
++ * same dead map generation, which can only ever fail the same way again.
++ */
++static blk_status_t nvme_prep_rq_batch(struct nvme_queue *nvmeq,
++				       struct request *req)
+ {
+ 	/*
+ 	 * We should not need to do this, but we're still using this to
+ 	 * ensure we can drain requests on a dying queue.
+ 	 */
+ 	if (unlikely(!test_bit(NVMEQ_ENABLED, &nvmeq->flags)))
+-		return false;
++		return BLK_STS_DEV_RESOURCE;
+ 	if (unlikely(!nvme_check_ready(&nvmeq->dev->ctrl, req, true)))
+-		return false;
++		return BLK_STS_DEV_RESOURCE;
+ 
+-	return nvme_prep_rq(req) == BLK_STS_OK;
++	return nvme_prep_rq(req);
+ }
+ 
+ static void nvme_queue_rqs(struct rq_list *rqlist)
+@@ -1945,14 +1954,37 @@ static void nvme_queue_rqs(struct rq_list *rqlist)
+ 	struct request *req;
+ 
+ 	while ((req = rq_list_pop(rqlist))) {
++		blk_status_t ret;
++
+ 		if (nvmeq && nvmeq != req->mq_hctx->driver_data)
+ 			nvme_submit_cmds(nvmeq, &submit_list);
+ 		nvmeq = req->mq_hctx->driver_data;
+ 
+-		if (nvme_prep_rq_batch(nvmeq, req))
++		ret = nvme_prep_rq_batch(nvmeq, req);
++		switch (ret) {
++		case BLK_STS_OK:
+ 			rq_list_add_tail(&submit_list, req);
+-		else
++			break;
++		case BLK_STS_RESOURCE:
++		case BLK_STS_DEV_RESOURCE:
+ 			rq_list_add_tail(&requeue_list, req);
++			break;
++		default:
++			/*
++			 * Terminal failure (including
++			 * NVME_STS_DMABUF_GENERATION_LOST): end the request
++			 * now rather than requeue it. Requeuing here would
++			 * loop it through nvme_queue_rqs() indefinitely
++			 * against the same generation, since nothing about a
++			 * terminal failure changes by retrying. No need to
++			 * flush submit_list first -- ending this request
++			 * doesn't interact with the unrelated ones already
++			 * prepared for this nvmeq; they still flush at the
++			 * normal points (nvmeq switch or loop exit).
++			 */
++			blk_mq_end_request(req, ret);
++			break;
++		}
+ 	}
+ 
+ 	if (nvmeq)
+-- 
+2.43.0
+

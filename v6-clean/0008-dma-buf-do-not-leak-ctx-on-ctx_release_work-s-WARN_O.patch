@@ -1,0 +1,56 @@
+From a1c1ef17e2f32a55c3421783aad4392237407d5c Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 15:20:53 +0530
+Subject: [PATCH 08/17] dma-buf: do not leak ctx on ctx_release_work's
+ WARN_ON_ONCE paths
+
+dma_buf_io_ctx_release_work(), added by patch 1 of "Add dmabuf read/write
+via io_uring", ends with two "cannot happen" checks:
+
+	if (WARN_ON_ONCE(ret <= 0))
+		return;
+	if (WARN_ON_ONCE(rcu_dereference_protected(ctx->map, true)))
+		return;
+
+	if (refcount_dec_and_test(&ctx->refs))
+		dma_buf_io_ctx_destroy_work(&ctx->release_work);
+
+Either WARN firing returns before the reference is dropped. A WARN is a
+"this should never happen" marker, not licence to leak: hitting either
+path permanently leaks ctx, the dma_buf reference it holds, the driver
+attachment, and now the target file this ctx pins.
+
+Warn on both conditions but fall through to the reference drop
+regardless.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ drivers/dma-buf/dma-buf-io.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index ef6e665d3558..ddcd653678fe 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -233,10 +233,14 @@ static void dma_buf_io_ctx_release_work(struct work_struct *work)
+ 	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
+ 				    false, MAX_SCHEDULE_TIMEOUT);
+ 
+-	if (WARN_ON_ONCE(ret <= 0))
+-		return;
+-	if (WARN_ON_ONCE(rcu_dereference_protected(ctx->map, true)))
+-		return;
++	/*
++	 * Both of these are "cannot happen" conditions, but an early return
++	 * here would skip the put below and permanently leak ctx, the
++	 * dma_buf reference it holds, the driver attachment, and now the
++	 * target file. Warn and still drop the reference rather than leak.
++	 */
++	WARN_ON_ONCE(ret <= 0);
++	WARN_ON_ONCE(rcu_dereference_protected(ctx->map, true));
+ 
+ 	dma_buf_io_ctx_put(ctx);
+ }
+-- 
+2.43.0
+

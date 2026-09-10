@@ -1,0 +1,48 @@
+From 96ffc0f471a4cceb8963adc1d3f6e33796656a42 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 15:33:09 +0530
+Subject: [PATCH 09/17] nvme-pci: fix map and sgt leak on the seg_shift
+ driver-bug path
+
+nvme_dma_buf_io_map(), added by patch 11 of "Add dmabuf read/write via
+io_uring", asserts that every DMA segment in the mapping is at least
+page-sized:
+
+	if (WARN_ON_ONCE(seg_shift < NVME_CTRL_PAGE_SHIFT))
+		return ERR_PTR(-EFAULT);
+
+Every other error in this function goes through the err: label, which
+unmaps the attachment and frees map. This one returns directly instead,
+so it leaks the nvme_dmabuf_map allocation and, more importantly, leaves
+the scatter-gather table mapped via dma_buf_map_attachment() with
+nothing left holding a reference to unmap it -- a real DMA mapping leak,
+not just memory.
+
+Route it through the existing err: label like every other failure in
+this function.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ drivers/nvme/host/pci.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 67e26d6e8f25..868524ca3575 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -2617,8 +2617,10 @@ static struct dma_buf_io_map *nvme_dma_buf_io_map(struct dma_buf_io_ctx *ctx)
+ 		}
+ 	}
+ 
+-	if (WARN_ON_ONCE(seg_shift < NVME_CTRL_PAGE_SHIFT))
+-		return ERR_PTR(-EFAULT);
++	if (WARN_ON_ONCE(seg_shift < NVME_CTRL_PAGE_SHIFT)) {
++		ret = -EFAULT;
++		goto err;
++	}
+ 
+ 	ret = dma_buf_io_init_map(ctx, &map->base);
+ 	if (ret)
+-- 
+2.43.0
+

@@ -1,0 +1,97 @@
+From 5909ff01921fd5264982a60674b9a3f83a0b2799 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 15:55:05 +0530
+Subject: [PATCH 17/17] dma-buf: annotate the fence signalling critical section
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The load-bearing claim of this whole series is that everything from
+fence publication (dma_resv_add_fence()) up to the fence signal takes no
+lock and allocates no memory -- that is what makes it safe for the
+percpu_ref release callback to run from arbitrary context, including a
+driver's hardware completion IRQ, and it is what avoids the deadlock
+class Christian König and Matthew Brost described on v4 (a GFP_KERNEL
+allocation on the signalling path can cycle back through reclaim and
+wait on the very fence it is blocking).
+
+That claim has so far only been asserted in comments. Wrap
+dma_buf_io_map_active_release() in dma_fence_begin_signalling() /
+dma_fence_end_signalling() so CONFIG_PROVE_LOCKING checks it on every
+boot, including on paths nobody thought to exercise by hand -- abort,
+cancellation, the various nvme setup-failure rollbacks that route
+through nvme_dmabuf_put_active() and can trigger this callback inline
+from within percpu_ref_put().
+
+This deliberately does not extend to nvme's timeout/reset/PCI-recovery
+escalation, which can also sit on the path to the last active put in the
+case where hardware never completes a request normally. Those paths are
+shared with every non-dma-buf request nvme handles and are not ours to
+place inside a fence signalling section. Whether they stay
+allocation-free is a real open question -- nvme_reset_work() does
+allocate -- and is tracked separately as a bounded-progress audit, not
+asserted here. Annotating only the cheap, already-understood end and
+treating that as proof the whole path is safe would be the same
+overclaiming mistake as an earlier draft of this series made when it
+first added the dedicated unmap workqueue.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ drivers/dma-buf/dma-buf-io.c | 26 +++++++++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index e2db606c3d2a..846c9cda7f61 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -142,6 +142,27 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ {
+ 	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
++	bool cookie;
++
++	/*
++	 * The load-bearing claim of this design is that everything from
++	 * fence publication (dma_resv_add_fence() in dma_buf_io_drop_map())
++	 * up to this signal takes no lock and allocates nothing -- that is
++	 * what makes it safe to run from arbitrary context, including a
++	 * driver's hardware completion IRQ. That claim was previously only
++	 * asserted in comments. Annotate it so lockdep checks it on every
++	 * boot with CONFIG_PROVE_LOCKING, including on paths nobody thought
++	 * to test by hand (abort, cancellation, the various nvme
++	 * setup-failure rollbacks that call nvme_dmabuf_put_active()).
++	 *
++	 * This does NOT cover nvme's timeout/reset/PCI-recovery escalation,
++	 * which can also sit on the path to the last active put. Those paths
++	 * are shared with every non-dma-buf request nvme handles and are not
++	 * ours to place inside a fence signalling section; whether they stay
++	 * allocation-free is tracked separately as an open question, not
++	 * asserted here.
++	 */
++	cookie = dma_fence_begin_signalling();
+ 
+ 	switch (map->release_mode) {
+ 	case DMA_BUF_IO_RELEASE_SYNC:
+@@ -151,7 +172,7 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ 		 * published for this generation.
+ 		 */
+ 		complete(&map->drain);
+-		return;
++		break;
+ 	case DMA_BUF_IO_RELEASE_FENCED:
+ 	default:
+ 		/*
+@@ -163,7 +184,10 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ 		dma_fence_signal(map->fence);
+ 		INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
+ 		queue_work(dma_buf_io_wq, &map->release_work);
++		break;
+ 	}
++
++	dma_fence_end_signalling(cookie);
+ }
+ 
+ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+-- 
+2.43.0
+

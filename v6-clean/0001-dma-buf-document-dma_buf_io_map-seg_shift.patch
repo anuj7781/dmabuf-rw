@@ -1,0 +1,65 @@
+From 9a9fd08a38bc83d6c3fc2df4dbc0a0c587fbd651 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 14:48:29 +0530
+Subject: [PATCH 01/17] dma-buf: document dma_buf_io_map::seg_shift
+
+The file I/O infrastructure added in patch 1 of "Add dmabuf read/write
+via io_uring" declares seg_shift with no explanation of what it means,
+who sets it, or why it exists. Christoph asked about this on v5 and it
+was never answered.
+
+It is the guaranteed minimum DMA segment size in the mapping, expressed
+as a power-of-2 shift: drivers compute it as the minimum of
+__ffs(sg_dma_len()) across the scatterlist, so every segment is at least
+1U << seg_shift bytes and a multiple of that size.
+
+That is what makes the block layer's segment bound work. A dma-buf bio
+reports a single segment to the block layer, so bio_split_io_at_dmabuf()
+cannot count segments by walking the mapping; instead it bounds the
+transfer arithmetically:
+
+	bytes <= (lim->max_segments << seg_shift) - offset
+
+Without seg_shift a fragmented mapping could produce far more descriptor
+entries than the driver's fixed-size pool holds.
+
+Document all of that at the field, including that ->map() must set it.
+
+No functional change.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ include/linux/dma-buf-io.h | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
+index f31c7375ae91..d72182acf2ed 100644
+--- a/include/linux/dma-buf-io.h
++++ b/include/linux/dma-buf-io.h
+@@ -34,6 +34,23 @@ struct dma_buf_io_map {
+ 	 * is deferred until all refs are dropped.
+ 	 */
+ 	struct percpu_ref		refs;
++
++	/*
++	 * Guaranteed minimum DMA segment size in this mapping, as a
++	 * power-of-2 shift: every segment is at least 1U << seg_shift bytes
++	 * and a multiple of that size. Drivers compute it as the minimum of
++	 * __ffs(sg_dma_len()) across the scatterlist; see
++	 * nvme_dma_buf_io_map(). Must be set by ->map().
++	 *
++	 * A dma-buf bio reports a single segment to the block layer, so this
++	 * is what lets bio_split_io_at_dmabuf() (block/blk-merge.c) bound the
++	 * transfer to lim->max_segments without walking the mapping:
++	 *
++	 *	bytes <= (lim->max_segments << seg_shift) - offset
++	 *
++	 * Without it a fragmented mapping could produce far more descriptor
++	 * entries than the driver's fixed-size pool holds.
++	 */
+ 	unsigned			seg_shift;
+ 
+ 	struct work_struct		release_work;
+-- 
+2.43.0
+

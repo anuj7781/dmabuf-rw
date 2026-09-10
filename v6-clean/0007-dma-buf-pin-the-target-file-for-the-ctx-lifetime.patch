@@ -1,0 +1,135 @@
+From e4a4e1a4bb286b7602799d752e7a8b393d91548f Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 15:20:08 +0530
+Subject: [PATCH 07/17] dma-buf: pin the target file for the ctx lifetime
+
+dma_buf_io_ctx_release(), added by patch 1 of "Add dmabuf read/write via
+io_uring", defers teardown to a worker that eventually calls
+ctx->dev_ops->release() -> dma_buf_detach(). The only caller,
+io_release_reg_dmabuf() in io_uring/rsrc.c (patch 12), does:
+
+	fput(db->target_file);
+	dma_buf_io_ctx_release(&db->ctx);
+
+fput() runs synchronously, before the async teardown has even been
+queued, let alone reached the driver callback that needs the file's
+device to still exist.
+
+Fix it in dma-buf core rather than in the caller: take ctx's own
+reference to the target file in dma_buf_io_ctx_create(), and drop it in
+dma_buf_io_ctx_destroy_work() after ->release()'s detach has run (from a
+local copy, since ctx may be embedded in a struct that the preceding
+kfree(ctx) just freed). This makes the ctx responsible for the file
+reference it actually depends on, instead of relying on the importer to
+happen to hold one for long enough. io_uring's own fput() is unaffected
+-- it releases its own registration-time reference, independent of ctx's.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ drivers/dma-buf/dma-buf-io.c | 17 +++++++++++++++++
+ include/linux/dma-buf-io.h   |  9 +++++++++
+ io_uring/rsrc.c              |  7 +++++++
+ 3 files changed, 33 insertions(+)
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index 699e98977f6c..ef6e665d3558 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -6,6 +6,7 @@
+  */
+ #include <linux/dma-buf-io.h>
+ #include <linux/dma-resv.h>
++#include <linux/file.h>
+ 
+ static const char *dma_buf_io_fence_drv_name(struct dma_fence *fence)
+ {
+@@ -26,6 +27,7 @@ static void dma_buf_io_ctx_destroy_work(struct work_struct *work)
+ {
+ 	struct dma_buf_io_ctx *ctx = container_of(work, struct dma_buf_io_ctx,
+ 						  destroy_work);
++	struct file *file = ctx->file;
+ 
+ 	if (WARN_ON_ONCE(refcount_read(&ctx->refs)))
+ 		return;
+@@ -33,6 +35,12 @@ static void dma_buf_io_ctx_destroy_work(struct work_struct *work)
+ 	ctx->dev_ops->release(ctx);
+ 	dma_buf_put(ctx->dmabuf);
+ 	kfree(ctx);
++	/*
++	 * Dropped last, after ->release()'s detach and after ctx itself is
++	 * gone: ctx may be embedded in an importer struct that the kfree()
++	 * above just freed, hence the local copy taken first.
++	 */
++	fput(file);
+ }
+ 
+ /*
+@@ -261,11 +269,19 @@ int dma_buf_io_ctx_create(struct file *file,
+ 	INIT_WORK(&ctx->release_work, dma_buf_io_ctx_release_work);
+ 	INIT_WORK(&ctx->destroy_work, dma_buf_io_ctx_destroy_work);
+ 	get_dma_buf(dmabuf);
++	/*
++	 * ctx teardown is asynchronous and calls back into the driver behind
++	 * @file (->release() -> dma_buf_detach()), which can run long after
++	 * the importer drops its own reference to @file. Hold one of our own
++	 * for the ctx's whole lifetime rather than depending on theirs.
++	 */
++	ctx->file = get_file(file);
+ 
+ 	ret = file->f_op->init_dma_buf_io_ctx(file, ctx);
+ 	if (ret) {
+ 		memset(ctx, 0, sizeof(*ctx));
+ 		dma_buf_put(dmabuf);
++		fput(file);
+ 		return ret;
+ 	}
+ 
+@@ -284,6 +300,7 @@ int dma_buf_io_ctx_create(struct file *file,
+ 			ctx->dev_ops->release(ctx);
+ 		memset(ctx, 0, sizeof(*ctx));
+ 		dma_buf_put(dmabuf);
++		fput(file);
+ 		return -EINVAL;
+ 	}
+ 
+diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
+index 9215c5a19848..f3adb7c5c4a2 100644
+--- a/include/linux/dma-buf-io.h
++++ b/include/linux/dma-buf-io.h
+@@ -78,6 +78,15 @@ struct dma_buf_io_ctx {
+ 	struct work_struct			destroy_work;
+ 	refcount_t				refs;
+ 
++	/*
++	 * The target file this ctx was created against, pinned for the ctx's
++	 * whole lifetime. Teardown is asynchronous and calls back into the
++	 * driver (->release() -> dma_buf_detach()), so the importer's own
++	 * reference to this file must not be what keeps that driver state
++	 * alive.
++	 */
++	struct file				*file;
++
+ 	void					*dev_priv;
+ 	const struct dma_buf_io_ops		*dev_ops;
+ };
+diff --git a/io_uring/rsrc.c b/io_uring/rsrc.c
+index 5074b1e4b050..dc81bb48d01a 100644
+--- a/io_uring/rsrc.c
++++ b/io_uring/rsrc.c
+@@ -891,6 +891,13 @@ static void io_release_reg_dmabuf(void *priv)
+ {
+ 	struct io_regbuf_dma *db = priv;
+ 
++	/*
++	 * dma_buf_io_ctx_release() defers teardown to a worker that calls
++	 * back into db->target_file's driver via ->release() ->
++	 * dma_buf_detach(). dma_buf_io_ctx_create() took its own reference
++	 * to that file for exactly this reason, so this fput() does not need
++	 * to (and must not) outlive it.
++	 */
+ 	fput(db->target_file);
+ 	dma_buf_io_ctx_release(&db->ctx);
+ }
+-- 
+2.43.0
+
