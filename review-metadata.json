@@ -1,8 +1,8 @@
 {
-  "author": "Anuj Gupta <anuj20.g@samsung.com>",
-  "sha": "5fe6c52218f8079f0a7abe2c3e2d03038792b4d2",
-  "subject": "nvme-pci: add SGL support for the dmabuf path",
-  "issues-found": 2,
-  "issue-severity-score": "high",
-  "issue-severity-explanation": "Without an actual DMA-BUF segment-limit check, fragmented requests can overrun the one-page SGL pool; request-relative counting also causes large repeated SG-table prefix scans."
+  "author": "Anuj Gupta <anuj1072538@gmail.com>",
+  "sha": "8974acc1dea118920ecf8bae01b00a50a96f1b2e",
+  "subject": "dma-buf: fix ctx teardown races and honour the wait-under-resv rule",
+  "issues-found": 1,
+  "issue-severity-score": "medium",
+  "issue-severity-explanation": "Two NVMe recovery paths can defer the final active-reference release while performing reclaim-capable reset or PCI recovery work; this needs a bounded-progress audit but is not a demonstrated lifetime-series failure."
 }
