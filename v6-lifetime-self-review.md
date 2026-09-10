@@ -229,14 +229,44 @@ documented as deprecated*. So the wrapper struct and its `spinlock_t lock`
 should both go; `map->fence` becomes a plain `struct dma_fence *` initialised
 with a NULL lock argument.
 
-**P3-2. `ctx->refs` is still `refcount_t`, not `kref`.** Christian, v4:
+**Thread status: agreed but not delivered.** Pavel's reply to this comment
+(`v4-discussion:6347`) was a one-word "ok". He accepted it and then never made
+the change — v5's `dma-buf-io.c` is byte-identical here, and so is ours. That
+makes this a real outstanding item rather than a speculative one.
+
+**P3-2. RETRACTED — `ctx->refs` as `refcount_t` is a settled question.**
+
+This section previously claimed Christian's question had "never been answered"
+and that we should either convert or have a reason ready. Both halves are
+wrong; the thread answers it.
+
+Christian, v4 (`v4-discussion:5956`):
 
 > And why are you using refcount directly instead of kref?
 
-Still `refcount_t` (`include/linux/dma-buf-io.h:131`). The TOCTOU pattern he
-objected to is gone, so this is now purely the API-consistency question he
-actually asked — which has never been answered. Either convert it or have a
-reason ready.
+Pavel, same thread (`v4-discussion:6374`):
+
+> Not sure it'd make much difference here.
+
+Christian replied to that message on 2026-08-06 07:29 — the **last message in
+the thread** — and did not raise it again. He picked up the `kfree(map)` point
+and gave the fence-ordering protocol; kref went unmentioned.
+
+Note also that the kref question was bundled with the TOCTOU objection ("Stuff
+like that is usually illegal" on `refcount_read() == 0` followed by
+`refcount_inc()`). That was the substantive half and it is already fixed: we
+take an unconditional pin in `dma_buf_io_init_map()`. What remains is a style
+question the author declined and the maintainer dropped.
+
+**Do not convert it.** Doing so would re-litigate a settled point and would
+override the series author's stated preference on his own code. The only thing
+worth keeping is awareness that `map->refs` is a `kref` while `ctx->refs` is a
+`refcount_t` — if that inconsistency is ever raised, this is the history.
+
+Method note: the original claim came from reading Christian's message without
+checking whether it had been answered. Same error as the retracted P1-1 above.
+Before citing any maintainer comment as outstanding, read to the end of the
+thread.
 
 ---
 
