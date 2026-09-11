@@ -1,10 +1,10 @@
-From 8f5d91f3b4aba992f6aa8452b8996551889afdbe Mon Sep 17 00:00:00 2001
+From 47477a680033fb78722fb534102046f8cf1c91b5 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:54:10 +0530
 Subject: [PATCH 16/17] dma-buf: defer percpu_ref_exit() to the map's final
  release
 
-Keep the active reference initialized until the final software map reference is released.
+Keep the active reference initialized until final map release.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 
