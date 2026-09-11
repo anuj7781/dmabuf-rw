@@ -1,7 +1,7 @@
-From 441a6ecb8c6fe50f413600e1184445f87c030563 Mon Sep 17 00:00:00 2001
+From 9e442a23fac7a224823b136a5e8067f63924bb32 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:49:32 +0530
-Subject: [PATCH 15/17] nvme-pci: end terminal dma-buf failures instead of
+Subject: [PATCH 16/18] nvme-pci: end terminal dma-buf failures instead of
  requeuing them
 
 The previous commit made a dma-buf generation-loss rejection
@@ -40,7 +40,7 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  1 file changed, 38 insertions(+), 6 deletions(-)
 
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
-index 2cdd732844a3..b81ebe78db28 100644
+index 99604d37f864..ca1691447beb 100644
 --- a/drivers/nvme/host/pci.c
 +++ b/drivers/nvme/host/pci.c
 @@ -1923,18 +1923,27 @@ static void nvme_submit_cmds(struct nvme_queue *nvmeq, struct rq_list *rqlist)

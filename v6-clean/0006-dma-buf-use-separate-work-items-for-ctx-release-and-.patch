@@ -1,41 +1,20 @@
-From 38ecc0772bfd11e75211c046fd0c8ea609d99596 Mon Sep 17 00:00:00 2001
+From 551ccf6d6c2f39792ee647ea62fa9943681ead11 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:18:18 +0530
-Subject: [PATCH 06/17] dma-buf: use separate work items for ctx release and
+Subject: [PATCH 06/18] dma-buf: use separate work items for ctx release and
  destroy
 
-The file I/O infrastructure added in patch 1 of "Add dmabuf read/write
-via io_uring" reuses a single ctx->release_work for two different
-callbacks. dma_buf_io_ctx_release() INIT_WORK()s it to
-dma_buf_io_ctx_release_work() and queues it; when the last ctx reference
-drops -- from dma_buf_io_map_release_work() or from
-dma_buf_io_ctx_release_work() itself -- it gets INIT_WORK()'d again to
-dma_buf_io_ctx_destroy_work() and requeued.
-
-The two can overlap. dma_buf_io_ctx_release_work() calls dma_fence_signal()
-(via dma_buf_io_drop_map() -> the map's own release path) before it
-finishes running, and dma_buf_io_map_release_work() drops the final ctx
-reference right after that signal. So the map's release worker can
-INIT_WORK() the same work_struct that dma_buf_io_ctx_release_work() is
-still executing on -- reinitialising a work item while its callback is
-running.
-
-Give ctx a second work item, destroy_work, dedicated to the final free.
-Initialise both exactly once, in dma_buf_io_ctx_create(), and never
-re-initialise either. Collapse the three open-coded
-"refcount_dec_and_test() then INIT_WORK()+queue_work()" sites into a
-single dma_buf_io_ctx_put() helper, which always defers the free to a
-worker -- callers may be holding dma_resv, which
-ctx->dev_ops->release() -> dma_buf_detach() takes as well.
+The map release path can reinitialize the ctx release work item while it
+is running. Use separate work items for release and destruction.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 ---
- drivers/dma-buf/dma-buf-io.c | 31 ++++++++++++++++++-------------
- include/linux/dma-buf-io.h   | 11 +++++++++++
- 2 files changed, 29 insertions(+), 13 deletions(-)
+ drivers/dma-buf/dma-buf-io.c | 32 ++++++++++++++++----------------
+ include/linux/dma-buf-io.h   |  2 ++
+ 2 files changed, 18 insertions(+), 16 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index bb6763ffdd72..699e98977f6c 100644
+index 81f5e5cf60c1..e4c6ba4c2812 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
 @@ -25,7 +25,7 @@ const struct dma_fence_ops dma_buf_io_fence_ops = {
@@ -81,7 +60,7 @@ index bb6763ffdd72..699e98977f6c 100644
  }
  
  static void dma_buf_io_map_refs_release(struct percpu_ref *ref)
-@@ -226,17 +230,16 @@ static void dma_buf_io_ctx_release_work(struct work_struct *work)
+@@ -219,17 +223,11 @@ static void dma_buf_io_ctx_release_work(struct work_struct *work)
  	if (WARN_ON_ONCE(rcu_dereference_protected(ctx->map, true)))
  		return;
  
@@ -92,17 +71,15 @@ index bb6763ffdd72..699e98977f6c 100644
  
  void dma_buf_io_ctx_release(struct dma_buf_io_ctx *ctx)
  {
- 	/*
- 	 * Destruction needs to wait for I/O and dma fences. Defer it to
+-	/*
+-	 * Destruction needs to wait for I/O and dma fences. Defer it to
 -	 * simplify locking.
-+	 * simplify locking. release_work was initialised once in
-+	 * dma_buf_io_ctx_create() and is never re-initialised.
- 	 */
+-	 */
 -	INIT_WORK(&ctx->release_work, dma_buf_io_ctx_release_work);
  	queue_work(system_wq, &ctx->release_work);
  }
  
-@@ -255,6 +258,8 @@ int dma_buf_io_ctx_create(struct file *file,
+@@ -248,6 +246,8 @@ int dma_buf_io_ctx_create(struct file *file,
  	ctx->dir = dir;
  	ctx->dmabuf = dmabuf;
  	refcount_set(&ctx->refs, 1);
@@ -112,23 +89,14 @@ index bb6763ffdd72..699e98977f6c 100644
  
  	ret = file->f_op->init_dma_buf_io_ctx(file, ctx);
 diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
-index 26fe4c7228eb..9215c5a19848 100644
+index 591fba5a675a..23f282d31f36 100644
 --- a/include/linux/dma-buf-io.h
 +++ b/include/linux/dma-buf-io.h
-@@ -64,7 +64,18 @@ struct dma_buf_io_ctx {
+@@ -52,7 +52,9 @@ struct dma_buf_io_ctx {
  
  	atomic_t				fence_seq;
  	u64					fence_ctx;
 +
-+	/*
-+	 * Two distinct work items, not one reused. release_work runs the
-+	 * user-visible teardown (drop the last map, wait for its fence);
-+	 * destroy_work runs the final free once ->refs hits zero. The last
-+	 * map's release worker can drop that final reference while
-+	 * release_work's callback is still executing, so re-initialising a
-+	 * single shared work_struct would be racing a work item against
-+	 * itself.
-+	 */
  	struct work_struct			release_work;
 +	struct work_struct			destroy_work;
  	refcount_t				refs;

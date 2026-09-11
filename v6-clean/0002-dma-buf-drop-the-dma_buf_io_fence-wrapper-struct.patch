@@ -1,47 +1,9 @@
-From eb19ca81ca2997da1020f1e8e0806b5e6fccd9fd Mon Sep 17 00:00:00 2001
+From 1e2f562ed8d0c1395d0ec743aa791689e89d40fa Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 14:51:08 +0530
-Subject: [PATCH 02/17] dma-buf: drop the dma_buf_io_fence wrapper struct
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Subject: [PATCH 02/18] dma-buf: drop the dma_buf_io_fence wrapper struct
 
-The file I/O infrastructure added in patch 1 of "Add dmabuf read/write
-via io_uring" wraps its drain fence in
-
-	struct dma_buf_io_fence {
-		struct dma_fence base;
-		spinlock_t lock;
-	};
-
-purely to supply the spinlock. dma_fence can carry its own now:
-
-	union {
-		spinlock_t *extern_lock;
-		spinlock_t inline_lock;
-	};
-
-__dma_fence_init() takes the inline lock when passed a NULL lock pointer
-and sets DMA_FENCE_FLAG_INLINE_LOCK_BIT; the external lock is documented
-as deprecated, and the stub fence in dma-fence.c already passes NULL.
-
-So map->fence becomes a plain struct dma_fence * initialised with a NULL
-lock. This also removes
-
-	/* default fence release kfree's the base pointer */
-	BUILD_BUG_ON(offsetof(struct dma_buf_io_fence, base));
-
-which existed only to assert that the wrapper's first member was the
-fence, so that dma_fence_release()'s default dma_fence_free() ->
-kfree_rcu() freed the right pointer. With a plain allocation that holds
-by construction.
-
-No functional change.
-
-Christian König asked for this on v4 -- "Upstream has changed to allow
-embedding the spinlock into the dma_fence, so this structure here is
-most likely not necessary any more" -- and Pavel agreed at the time, but
-the change never landed in v5.
+Use dma_fence's inline lock instead of a wrapper.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 ---
@@ -136,7 +98,7 @@ index 24f58f80c45c..6834a79700ce 100644
  	 * Delay destruction until all inflight requests using the map are
  	 * gone. It'll also signal the fence then.
 diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
-index d72182acf2ed..26fe4c7228eb 100644
+index d4f25c00bdc6..591fba5a675a 100644
 --- a/include/linux/dma-buf-io.h
 +++ b/include/linux/dma-buf-io.h
 @@ -4,7 +4,6 @@
@@ -147,7 +109,7 @@ index d72182acf2ed..26fe4c7228eb 100644
  struct dma_buf_io_ctx;
  struct dma_buf_io_map;
  
-@@ -54,7 +53,7 @@ struct dma_buf_io_map {
+@@ -42,7 +41,7 @@ struct dma_buf_io_map {
  	unsigned			seg_shift;
  
  	struct work_struct		release_work;

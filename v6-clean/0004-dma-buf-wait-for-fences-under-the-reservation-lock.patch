@@ -1,32 +1,10 @@
-From 337c34899067775af4d2d5ff8341865c834fae6a Mon Sep 17 00:00:00 2001
+From 0c1217db9b22f68259e3e3259ff2432209599b1c Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 14:52:49 +0530
-Subject: [PATCH 04/17] dma-buf: wait for fences under the reservation lock
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Subject: [PATCH 04/18] dma-buf: wait for fences under the reservation lock
 
-dma_buf_io_create_map(), added in patch 1 of "Add dmabuf read/write via
-io_uring", waits for the exporter's fences twice: once before taking the
-reservation lock with MAX_SCHEDULE_TIMEOUT, then again under the lock
-with a zero timeout, dropping the lock and restarting the whole sequence
-if that second wait finds anything outstanding.
-
-Christian König NAK'd exactly this on v4:
-
-  Clear NAK to that. Always wait while holding the resv lock if you can!
-  It is absolutely not beneficial to do this outside of the lock and
-  usually just hides problems instead and prevent fixing them.
-
-Waiting under the lock is explicitly permitted by dma_resv, so do that:
-lock, check the cache, wait, map, unlock. The unlock/retry loop goes
-away, and with it the window in which the fence set could change between
-the wait succeeding and ->map() running -- which is the class of problem
-the pre-lock wait was hiding.
-
-The zero-timeout probe also had a subtle bug of its own: it tested
-"< 0", so a return of 0 (fences still outstanding) fell through to
-->map() instead of retrying. That disappears with the restructure.
+Keep the reservation lock held from the fence wait through map creation,
+so a new fence cannot be installed between them.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 ---
@@ -34,7 +12,7 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  1 file changed, 11 insertions(+), 18 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index c2fd4a43d333..da1530ec1057 100644
+index fbf91db5617e..0821f740681a 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
 @@ -113,19 +113,6 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)

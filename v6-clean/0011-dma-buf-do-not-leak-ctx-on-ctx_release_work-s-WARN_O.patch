@@ -1,7 +1,7 @@
-From 8bee32379cdd6da21ec6009ce38d7fc6c0f9c811 Mon Sep 17 00:00:00 2001
+From 29f60ef1052682de780bd7739f0ce1cc18aa9f7c Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:20:53 +0530
-Subject: [PATCH 10/17] dma-buf: do not leak ctx on ctx_release_work's
+Subject: [PATCH 11/18] dma-buf: do not leak ctx on ctx_release_work's
  WARN_ON_ONCE paths
 
 dma_buf_io_ctx_release_work(), added by patch 1 of "Add dmabuf read/write
@@ -33,18 +33,20 @@ concurrent dma_buf_io_create_map() can legitimately republish a fresh map
 to ctx->map between drop_map()'s unlock and this wait returning.
 
 That second case is exactly why this commit must come after "dma-buf:
-split map lifetime into software and active references", not before it.
-Once a map exists, safely falling through to drop the reference here
-depends on that map holding its own pin on ctx (dma_buf_io_init_map()'s
-unconditional refcount_inc(), dropped only by the map's own
-active-release worker after it finishes unmap) -- otherwise dropping the
-reference here while a live map's ctx pointer is still in use is a
-straightforward use-after-free waiting to happen, not a warning. Before
-that pin existed, the only safe response to either WARN would have been
-to leak rather than free, which is the bug this commit exists to fix.
-With the pin in place, warn on both conditions but fall through to the
-reference drop unconditionally: ctx cannot reach zero out from under a
-live map, because that map is itself holding a reference.
+split map pointer and DMA-active lifetimes", not before it. Once a map
+exists, safely falling through to drop the reference here depends on
+that map holding its own pin on ctx -- dma_buf_io_init_map()'s
+unconditional refcount_inc(), which that map's own software kref keeps
+alive for as long as anything holds a pointer to it, dropped only once
+the map's last reference is released. Before that invariant existed,
+falling through unconditionally on either WARN would have risked
+dropping ctx's reference while a live map's ctx pointer was still in
+use -- a straightforward use-after-free waiting to happen, not a
+warning, so the only safe response then would have been to leak rather
+than free. That is the bug this commit exists to fix. With the invariant
+in place, warn on both conditions but fall through to the reference drop
+unconditionally: ctx cannot reach zero out from under a live map,
+because that map is itself holding a reference.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 ---
@@ -52,10 +54,10 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  1 file changed, 8 insertions(+), 4 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index dd80bc9eea03..0d6574270737 100644
+index 9cf1ac2f78e9..acef9d475768 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
-@@ -285,10 +285,14 @@ static void dma_buf_io_ctx_release_work(struct work_struct *work)
+@@ -259,10 +259,14 @@ static void dma_buf_io_ctx_release_work(struct work_struct *work)
  	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
  				    false, MAX_SCHEDULE_TIMEOUT);
  

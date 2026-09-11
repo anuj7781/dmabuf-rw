@@ -1,7 +1,7 @@
-From c311ae76203ada757d29884b43e27739a9780e60 Mon Sep 17 00:00:00 2001
+From e5fe3905e4aa61bca923075aafbc9dd6b7d164c5 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:40:08 +0530
-Subject: [PATCH 12/17] dma-buf: run deferred unmap on a WQ_MEM_RECLAIM
+Subject: [PATCH 13/18] dma-buf: run deferred unmap on a WQ_MEM_RECLAIM
  workqueue
 
 The active-ref release callback (previous commit) queues the actual
@@ -34,7 +34,7 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  1 file changed, 24 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index 181eb5a47c05..638bd18e6749 100644
+index 5155d2d5517a..f16a2a3eb350 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
 @@ -8,6 +8,20 @@
@@ -58,7 +58,7 @@ index 181eb5a47c05..638bd18e6749 100644
  static const char *dma_buf_io_fence_drv_name(struct dma_fence *fence)
  {
  	return "dma-buf-io-ctx";
-@@ -131,7 +145,7 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+@@ -121,7 +135,7 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
  		 */
  		dma_fence_signal(map->fence);
  		INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
@@ -67,7 +67,7 @@ index 181eb5a47c05..638bd18e6749 100644
  	}
  }
  
-@@ -413,3 +427,12 @@ int dma_buf_io_ctx_create(struct file *file,
+@@ -371,3 +385,12 @@ int dma_buf_io_ctx_create(struct file *file,
  
  	return ret;
  }

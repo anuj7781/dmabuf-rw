@@ -1,0 +1,345 @@
+From 9966bd9e3ddb2ebc8a464ed47d7c0022cd475836 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Fri, 11 Sep 2026 14:18:22 +0530
+Subject: [PATCH 10/18] dma-buf: split map pointer and DMA-active lifetimes
+
+The map reference currently covers both software pointer holders and
+device access to the DMA mapping. Importers can hold it across
+reclaim-capable I/O preparation, while invalidation publishes a fence
+whose signalling depends on that reference draining -- coupling the
+fence's forward progress to whatever a holder does while it sits in the
+block layer.
+
+Use a kref for the map object's software lifetime and retain the
+percpu_ref only for users that may access the DMA mapping:
+
+  - map->refs (kref): "some importer holds a pointer." Taken by
+    dma_buf_io_get_map() / dma_buf_io_create_map(), dropped by
+    dma_buf_io_map_drop(). Never gates the DMA mapping.
+  - map->active (percpu_ref): "the DMA mapping may still be in use."
+    Killed by dma_buf_io_drop_map() on invalidation; dev_ops->unmap()
+    only runs once every reference taken before the kill is returned.
+
+For now ->active is acquired and released at exactly the same points as
+->refs -- import and drop -- so this is v5's original single counter,
+split into two, with no change in when unmap happens. A later change
+moves ->active's acquisition to a driver's hardware-submission funnel;
+until then the two move together and are never held independently.
+
+Reclaim the map through RCU: since ->refs is a plain kref now, its
+release is synchronous and can in principle race a concurrent
+dma_buf_io_get_map() that is mid kref_get_unless_zero() on memory about
+to be freed. Free the map's container through an RCU callback
+(dev_ops->free_map()) instead of the direct kfree() v5 used, so an
+in-flight RCU read-side lookup always completes against valid memory.
+Wire this up for nvme-pci.
+
+Keep the map's ctx pin -- taken unconditionally in dma_buf_io_init_map()
+by the previous commit -- alive until that same RCU callback, not just
+through unmap. This is stronger than the previous commit's rule and is
+the point of this one: it makes "a live software reference to a map
+guarantees map->ctx is valid" a real invariant for the map's entire
+lifetime, not merely up to unmap. The map's own ctx pin is what makes
+this true, so there is nothing to cache -- the RCU callback reads
+map->ctx directly (saving it locally before free_map(), which frees the
+container embedding map) rather than through a separate ctx->dev_ops
+cache keyed off the map. Any future code holding a kref on a map, not
+just this series' own, can rely on map->ctx without a pin of its own.
+
+This can defer ctx's own teardown -- ->dev_ops->release(), and with it
+the target file and dma_buf references -- while a stale map software
+holder remains: today that only happens once every kref on a given map
+generation has dropped, not merely once it has been unmapped. The number
+of such holders is bounded (invalidation unpublishes the map from
+ctx->map before draining it, so no new ones can appear), but an
+individual holder's lifetime is not. For the current io_uring consumer
+this is not a new delay: the same request already pins the buffer
+resource node containing ctx for its own lifetime. Other consumers of
+this generic API inherit the same, stronger ownership rule and its
+corresponding release delay.
+
+This patch does not yet move the active acquisition point; a later NVMe
+patch does that together with its setup-failure rollback paths.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ drivers/dma-buf/dma-buf-io.c | 79 ++++++++++++++++++++++++------------
+ drivers/nvme/host/pci.c      |  7 ++++
+ include/linux/dma-buf-io.h   | 42 ++++++++++++++++---
+ 3 files changed, 96 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index 12e37c5924af..9cf1ac2f78e9 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -49,6 +49,28 @@ static void dma_buf_io_ctx_put(struct dma_buf_io_ctx *ctx)
+ 		queue_work(system_wq, &ctx->destroy_work);
+ }
+ 
++/*
++ * Runs once the map's last software reference drops. map->ctx is still
++ * valid here -- see the ctx pin in dma_buf_io_init_map() -- so save it
++ * before free_map(), which frees the container embedding @map.
++ */
++static void dma_buf_io_map_free_rcu(struct rcu_head *rcu)
++{
++	struct dma_buf_io_map *map = container_of(rcu, struct dma_buf_io_map, rcu);
++	struct dma_buf_io_ctx *ctx = map->ctx;
++
++	ctx->dev_ops->free_map(map);
++	dma_buf_io_ctx_put(ctx);
++}
++
++void __dma_buf_io_map_free(struct kref *kref)
++{
++	struct dma_buf_io_map *map = container_of(kref, struct dma_buf_io_map, refs);
++
++	call_rcu(&map->rcu, dma_buf_io_map_free_rcu);
++}
++EXPORT_SYMBOL_NS_GPL(__dma_buf_io_map_free, "DMA_BUF");
++
+ static void dma_buf_io_map_release_work(struct work_struct *work)
+ {
+ 	struct dma_buf_io_map *map = container_of(work, struct dma_buf_io_map,
+@@ -57,11 +79,6 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ 	struct dma_buf_io_ctx *ctx = map->ctx;
+ 	struct dma_buf *dmabuf = ctx->dmabuf;
+ 
+-	/*
+-	 * ctx is guaranteed alive here: dma_buf_io_init_map() pinned it for
+-	 * this map's entire lifetime, and that pin is only dropped below.
+-	 */
+-
+ 	/*
+ 	 * There are no more requests using the map, we can signal the fence.
+ 	 * It should be done before taking the resv lock as someone could be
+@@ -74,15 +91,13 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ 	dma_resv_unlock(dmabuf->resv);
+ 
+ 	dma_fence_put(fence);
+-	percpu_ref_exit(&map->refs);
+-	kfree(map);
+-
+-	dma_buf_io_ctx_put(ctx);
++	percpu_ref_exit(&map->active);
++	kref_put(&map->refs, __dma_buf_io_map_free);
+ }
+ 
+-static void dma_buf_io_map_refs_release(struct percpu_ref *ref)
++static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ {
+-	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, refs);
++	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
+ 
+ 	/* might sleep, use a worker */
+ 	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
+@@ -98,7 +113,8 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+ 	if (!fence)
+ 		return -ENOMEM;
+ 
+-	ret = percpu_ref_init(&map->refs, dma_buf_io_map_refs_release, 0, GFP_KERNEL);
++	ret = percpu_ref_init(&map->active, dma_buf_io_map_active_release, 0,
++			      GFP_KERNEL);
+ 	if (ret) {
+ 		kfree(fence);
+ 		return ret;
+@@ -108,15 +124,11 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+ 		       atomic_inc_return(&ctx->fence_seq));
+ 	map->fence = fence;
+ 	map->ctx = ctx;
++	kref_init(&map->refs);
+ 
+ 	/*
+-	 * Pin ctx alive for this map's entire lifetime: the release worker
+-	 * above needs ctx->dev_ops and ctx->dmabuf->resv to call unmap(), and
+-	 * it runs independently of whether any importer still holds a
+-	 * reference to the map. Dropped by that worker once unmap() has
+-	 * completed.
+-	 *
+-	 * Must be an unconditional reference taken up front, not the
++	 * Pin ctx for as long as this map's software reference lives -- see
++	 * struct dma_buf_io_map::refs. Must be unconditional, not the
+ 	 * WARN_ON_ONCE(refcount_read()==0) then refcount_inc() pattern this
+ 	 * function used to have here -- Christian König flagged exactly that
+ 	 * check-then-increment as "usually illegal" on v4.
+@@ -161,17 +173,29 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 	}
+ 
+ 	if (WARN_ON_ONCE(!map->seg_shift)) {
++		/*
++		 * Driver bug: ->map() returned successfully without setting
++		 * seg_shift. Nothing can be using this map yet -- it was
++		 * never published to ctx->map -- so unwind via the normal
++		 * kref release: it drops this map's own pin on ctx (taken in
++		 * dma_buf_io_init_map()) once free_map() has run.
++		 */
+ 		ctx->dev_ops->unmap(ctx, map);
+ 		dma_fence_put(map->fence);
+-		percpu_ref_exit(&map->refs);
+-		kfree(map);
+-		/* Drop this map's pin on ctx, taken in dma_buf_io_init_map(). */
+-		dma_buf_io_ctx_put(ctx);
++		percpu_ref_exit(&map->active);
++		kref_put(&map->refs, __dma_buf_io_map_free);
+ 		ret = -EFAULT;
+ 		goto out;
+ 	}
+ 
+-	percpu_ref_get(&map->refs);
++	/*
++	 * map->refs was kref_init()'d to 1 by dma_buf_io_init_map(), owned by
++	 * ctx (dropped once the last software reference to this generation
++	 * is released). This get is the calling request's own reference,
++	 * matching the cache-hit path above.
++	 */
++	kref_get(&map->refs);
++	percpu_ref_get(&map->active);
+ 	rcu_assign_pointer(ctx->map, map);
+ out:
+ 	dma_resv_unlock(dmabuf->resv);
+@@ -199,7 +223,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 		struct dma_fence *fence = map->fence;
+ 
+ 		dma_fence_get(fence);
+-		percpu_ref_kill(&map->refs);
++		percpu_ref_kill(&map->active);
+ 		dma_fence_wait(fence, false);
+ 		dma_fence_put(fence);
+ 		return;
+@@ -210,7 +234,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 	 * Delay destruction until all inflight requests using the map are
+ 	 * gone. It'll also signal the fence then.
+ 	 */
+-	percpu_ref_kill(&map->refs);
++	percpu_ref_kill(&map->active);
+ }
+ 
+ void dma_buf_io_invalidate_mappings(struct dma_buf_io_ctx *ctx)
+@@ -279,7 +303,8 @@ int dma_buf_io_ctx_create(struct file *file,
+ 	if (WARN_ON_ONCE(!ctx->dev_ops ||
+ 			 !ctx->dev_ops->map ||
+ 			 !ctx->dev_ops->unmap ||
+-			 !ctx->dev_ops->release)) {
++			 !ctx->dev_ops->release ||
++			 !ctx->dev_ops->free_map)) {
+ 		if (ctx->dev_ops && ctx->dev_ops->release)
+ 			ctx->dev_ops->release(ctx);
+ 		memset(ctx, 0, sizeof(*ctx));
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 868524ca3575..36fa51fa5874 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -2654,10 +2654,17 @@ static void nvme_dma_buf_io_release(struct dma_buf_io_ctx *ctx)
+ 	dma_buf_detach(ctx->dmabuf, attach);
+ }
+ 
++/* Runs from an RCU callback once the map's last software reference drops. */
++static void nvme_dma_buf_io_free_map(struct dma_buf_io_map *map_base)
++{
++	kfree(to_nvme_dmabuf_map(map_base));
++}
++
+ const struct dma_buf_io_ops nvme_dma_buf_io_ops = {
+ 	.map		= nvme_dma_buf_io_map,
+ 	.unmap		= nvme_dma_buf_io_unmap,
+ 	.release	= nvme_dma_buf_io_release,
++	.free_map	= nvme_dma_buf_io_free_map,
+ };
+ 
+ static int nvme_pci_init_dma_buf_io_ctx(struct nvme_ctrl *ctrl,
+diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
+index 867709f84fc5..60e0386e5afc 100644
+--- a/include/linux/dma-buf-io.h
++++ b/include/linux/dma-buf-io.h
+@@ -3,6 +3,8 @@
+ #define __DMA_BUF_IO_H__
+ 
+ #include <linux/dma-buf.h>
++#include <linux/kref.h>
++#include <linux/rcupdate.h>
+ 
+ struct dma_buf_io_ctx;
+ struct dma_buf_io_map;
+@@ -25,14 +27,30 @@ struct dma_buf_io_ops {
+ 	 * parts of the token.
+ 	 */
+ 	void (*release)(struct dma_buf_io_ctx *);
++
++	/*
++	 * Free the driver's container of @map, called once the map's last
++	 * software reference is gone. @map is the first member of that
++	 * container. Runs from an RCU callback: must not sleep or block.
++	 */
++	void (*free_map)(struct dma_buf_io_map *map);
+ };
+ 
+ struct dma_buf_io_map {
+ 	/*
+-	 * Counts attached requests and other users. Device specific unmapping
+-	 * is deferred until all refs are dropped.
++	 * Software reference: one per pointer holder (ctx's own, plus one
++	 * per importer). A live reference guarantees map->ctx stays valid --
++	 * see dma_buf_io_init_map(). Does not gate the DMA mapping; only
++	 * ->active does.
+ 	 */
+-	struct percpu_ref		refs;
++	struct kref			refs;
++
++	/*
++	 * Active reference: gates the DMA mapping. Killed on invalidation;
++	 * dev_ops->unmap() only runs once every reference taken before the
++	 * kill has been returned.
++	 */
++	struct percpu_ref		active;
+ 
+ 	/*
+ 	 * DMA segment-length granularity, as a power-of-2 shift, for bounding
+@@ -43,6 +61,7 @@ struct dma_buf_io_map {
+ 	struct work_struct		release_work;
+ 	struct dma_fence		*fence;
+ 	struct dma_buf_io_ctx		*ctx;
++	struct rcu_head			rcu;
+ };
+ 
+ struct dma_buf_io_ctx {
+@@ -72,6 +91,19 @@ void dma_buf_io_ctx_release(struct dma_buf_io_ctx *ctx);
+ 
+ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx);
+ 
++/* Internal: kref release for the software reference. Not for direct use. */
++void __dma_buf_io_map_free(struct kref *kref);
++
++static inline bool dma_buf_io_map_active_tryget(struct dma_buf_io_map *map)
++{
++	return percpu_ref_tryget_live(&map->active);
++}
++
++static inline void dma_buf_io_map_active_put(struct dma_buf_io_map *map)
++{
++	percpu_ref_put(&map->active);
++}
++
+ static inline struct dma_buf_io_map *
+ dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
+ {
+@@ -80,7 +112,7 @@ dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
+ 	guard(rcu)();
+ 
+ 	map = rcu_dereference(ctx->map);
+-	if (unlikely(!map || !percpu_ref_tryget_live_rcu(&map->refs)))
++	if (unlikely(!map || !kref_get_unless_zero(&map->refs)))
+ 		return NULL;
+ 
+ 	return map;
+@@ -88,7 +120,7 @@ dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
+ 
+ static inline void dma_buf_io_map_drop(struct dma_buf_io_map *map)
+ {
+-	percpu_ref_put(&map->refs);
++	kref_put(&map->refs, __dma_buf_io_map_free);
+ }
+ 
+ /*
+-- 
+2.43.0
+

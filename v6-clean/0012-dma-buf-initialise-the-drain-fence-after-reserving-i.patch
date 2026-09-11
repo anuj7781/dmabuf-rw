@@ -1,7 +1,7 @@
-From 6e5d286024771c77174cca7562d31664cea8a8da Mon Sep 17 00:00:00 2001
+From 83792de0726dab69c3a761265e9818bafd97a59d Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:39:09 +0530
-Subject: [PATCH 11/17] dma-buf: initialise the drain fence after reserving its
+Subject: [PATCH 12/18] dma-buf: initialise the drain fence after reserving its
  slot
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -56,37 +56,40 @@ as good a place, requires no dma_resv access, and keeps "what to do to
 signal" and "which mode to signal in" next to each other instead of
 split across two functions.
 
+The SYNC fallback drops the map's software kref (kref_put()) but does
+not separately drop its pin on ctx: that pin is owned by the map's kref
+lifetime, not by this specific unmap path, so it is released the same
+way every other map generation's pin is -- from the kref's eventual RCU
+callback, once nothing holds a pointer to this map any more.
+
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 ---
- drivers/dma-buf/dma-buf-io.c | 94 +++++++++++++++++++++++++++---------
+ drivers/dma-buf/dma-buf-io.c | 88 ++++++++++++++++++++++++++++--------
  include/linux/dma-buf-io.h   | 20 ++++++++
- 2 files changed, 92 insertions(+), 22 deletions(-)
+ 2 files changed, 90 insertions(+), 18 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index 0d6574270737..181eb5a47c05 100644
+index acef9d475768..5155d2d5517a 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
-@@ -87,16 +87,9 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+@@ -80,12 +80,10 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ 	struct dma_buf *dmabuf = ctx->dmabuf;
+ 
  	/*
- 	 * ctx is guaranteed alive here: dma_buf_io_init_map() pinned it for
- 	 * this map's entire lifetime, and that pin is only dropped below,
--	 * after unmap.
-+	 * after unmap. The fence was already signalled from the active-ref
-+	 * release callback before this worker was even queued.
- 	 */
--
--	/*
 -	 * There are no more requests using the map, we can signal the fence.
 -	 * It should be done before taking the resv lock as someone could be
 -	 * waiting for the fence while holding the lock.
--	 */
++	 * The fence was already signalled from the active-ref release
++	 * callback before this worker was even queued; ctx stays valid
++	 * regardless, via this map's own kref-lifetime pin.
+ 	 */
 -	dma_fence_signal(fence);
 -
  	dma_resv_lock(dmabuf->resv, NULL);
  	ctx->dev_ops->unmap(ctx, map);
  	dma_resv_unlock(dmabuf->resv);
-@@ -110,13 +103,36 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
- 	dma_buf_io_ctx_put(ctx);
+@@ -95,13 +93,36 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ 	kref_put(&map->refs, __dma_buf_io_map_free);
  }
  
 +/*
@@ -125,7 +128,7 @@ index 0d6574270737..181eb5a47c05 100644
  }
  
  int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
-@@ -135,12 +151,19 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+@@ -120,11 +141,18 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
  		return ret;
  	}
  
@@ -140,15 +143,14 @@ index 0d6574270737..181eb5a47c05 100644
 +	 */
  	map->fence = fence;
  	map->ctx = ctx;
- 	map->dev_ops = ctx->dev_ops;
 +	map->release_mode = DMA_BUF_IO_RELEASE_FENCED;
  	kref_init(&map->refs);
 +	init_completion(&map->drain);
  
  	/*
- 	 * Pin ctx alive for this map's entire lifetime: the active-release
-@@ -202,7 +225,8 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
- 		 * yet -- it was never published to ctx->map.
+ 	 * Pin ctx for as long as this map's software reference lives -- see
+@@ -181,7 +209,8 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 		 * dma_buf_io_init_map()) once free_map() has run.
  		 */
  		ctx->dev_ops->unmap(ctx, map);
 -		dma_fence_put(map->fence);
@@ -156,8 +158,8 @@ index 0d6574270737..181eb5a47c05 100644
 +		kfree(map->fence);
  		percpu_ref_exit(&map->active);
  		kref_put(&map->refs, __dma_buf_io_map_free);
- 		/* Drop this map's pin on ctx, taken in dma_buf_io_init_map(). */
-@@ -246,19 +270,45 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 		ret = -EFAULT;
+@@ -220,19 +249,42 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
  
  	ret = dma_resv_reserve_fences(dmabuf->resv, 1);
  	if (WARN_ON_ONCE(ret)) {
@@ -182,9 +184,6 @@ index 0d6574270737..181eb5a47c05 100644
 +		map->fence = NULL;
 +		percpu_ref_exit(&map->active);
 +		kref_put(&map->refs, __dma_buf_io_map_free);
-+
-+		/* Drop this map's pin on ctx, taken in dma_buf_io_init_map(). */
-+		dma_buf_io_ctx_put(ctx);
  		return;
  	}
  
@@ -211,7 +210,7 @@ index 0d6574270737..181eb5a47c05 100644
  	percpu_ref_kill(&map->active);
  }
 diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
-index 7570f8f38c48..74ce107aeb2a 100644
+index 60e0386e5afc..78d3ac64315d 100644
 --- a/include/linux/dma-buf-io.h
 +++ b/include/linux/dma-buf-io.h
 @@ -2,6 +2,7 @@
@@ -222,7 +221,7 @@ index 7570f8f38c48..74ce107aeb2a 100644
  #include <linux/dma-buf.h>
  #include <linux/kref.h>
  #include <linux/rcupdate.h>
-@@ -37,6 +38,22 @@ struct dma_buf_io_ops {
+@@ -36,6 +37,22 @@ struct dma_buf_io_ops {
  	void (*free_map)(struct dma_buf_io_map *map);
  };
  
@@ -244,8 +243,8 @@ index 7570f8f38c48..74ce107aeb2a 100644
 +
  struct dma_buf_io_map {
  	/*
- 	 * Software reference: held by every holder of a *pointer* to this
-@@ -84,7 +101,10 @@ struct dma_buf_io_map {
+ 	 * Software reference: one per pointer holder (ctx's own, plus one
+@@ -58,7 +75,10 @@ struct dma_buf_io_map {
  	 */
  	unsigned			seg_shift;
  

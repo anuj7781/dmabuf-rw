@@ -1,7 +1,7 @@
-From 98e3848f9bd2c7ed2c2a98b98c76099e9273e0ba Mon Sep 17 00:00:00 2001
+From 5c34f0cae860bcfa2876539d8ab6b244d4445fae Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:41:20 +0530
-Subject: [PATCH 13/17] io_uring/rsrc: re-import when the cached dma-buf map is
+Subject: [PATCH 14/18] io_uring/rsrc: re-import when the cached dma-buf map is
  stale
 
 io_import_dmabuf(), added by patch 15 of "Add dmabuf read/write via
@@ -37,10 +37,10 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  1 file changed, 37 insertions(+), 3 deletions(-)
 
 diff --git a/io_uring/rsrc.c b/io_uring/rsrc.c
-index dc81bb48d01a..0b24ed260f4b 100644
+index 5074b1e4b050..f27eb3d0ebcc 100644
 --- a/io_uring/rsrc.c
 +++ b/io_uring/rsrc.c
-@@ -1287,6 +1287,39 @@ void io_drop_dmabuf_node(struct io_kiocb *req)
+@@ -1280,6 +1280,39 @@ void io_drop_dmabuf_node(struct io_kiocb *req)
  	req->flags &= ~REQ_F_DROP_DMABUF;
  }
  
@@ -80,7 +80,7 @@ index dc81bb48d01a..0b24ed260f4b 100644
  static int io_import_dmabuf(struct io_kiocb *req,
  			   int ddir, struct iov_iter *iter,
  			   struct io_mapped_ubuf *imu,
-@@ -1294,7 +1327,7 @@ static int io_import_dmabuf(struct io_kiocb *req,
+@@ -1287,7 +1320,7 @@ static int io_import_dmabuf(struct io_kiocb *req,
  			   unsigned issue_flags)
  {
  	struct io_regbuf_dma *db = imu->priv;
@@ -89,7 +89,7 @@ index dc81bb48d01a..0b24ed260f4b 100644
  
  	if (!IS_ENABLED(CONFIG_DMA_SHARED_BUFFER))
  		return -EOPNOTSUPP;
-@@ -1304,8 +1337,9 @@ static int io_import_dmabuf(struct io_kiocb *req,
+@@ -1297,8 +1330,9 @@ static int io_import_dmabuf(struct io_kiocb *req,
  		return -EBADF;
  
  	if (req->flags & REQ_F_DROP_DMABUF) {

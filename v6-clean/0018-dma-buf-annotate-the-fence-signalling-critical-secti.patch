@@ -1,7 +1,7 @@
-From 8c7291236eb6ad42ac920a77f0e3070b7c47b4f3 Mon Sep 17 00:00:00 2001
+From 9f9a87fa18dd9f25f748cf02479e9e80fad1c077 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:55:05 +0530
-Subject: [PATCH 17/17] dma-buf: annotate the fence signalling critical section
+Subject: [PATCH 18/18] dma-buf: annotate the fence signalling critical section
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -41,10 +41,10 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  1 file changed, 25 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index e2db606c3d2a..846c9cda7f61 100644
+index ec348ac54ce3..c373b5966631 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
-@@ -142,6 +142,27 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+@@ -132,6 +132,27 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
  static void dma_buf_io_map_active_release(struct percpu_ref *ref)
  {
  	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
@@ -72,7 +72,7 @@ index e2db606c3d2a..846c9cda7f61 100644
  
  	switch (map->release_mode) {
  	case DMA_BUF_IO_RELEASE_SYNC:
-@@ -151,7 +172,7 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+@@ -141,7 +162,7 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
  		 * published for this generation.
  		 */
  		complete(&map->drain);
@@ -81,7 +81,7 @@ index e2db606c3d2a..846c9cda7f61 100644
  	case DMA_BUF_IO_RELEASE_FENCED:
  	default:
  		/*
-@@ -163,7 +184,10 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+@@ -153,7 +174,10 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
  		dma_fence_signal(map->fence);
  		INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
  		queue_work(dma_buf_io_wq, &map->release_work);
