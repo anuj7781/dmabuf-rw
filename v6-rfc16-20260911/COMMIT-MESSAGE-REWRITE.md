@@ -1,8 +1,8 @@
 # Commit-message rewrite notes
 
-This RFC series contains patches 1-16 from `anuj/dmabuf-v6-clean-fixed`.
-The lockdep annotation patch was intentionally left out so the discussion can
-focus on the lifetime and invalidation design.
+This RFC series is generated from `anuj/dmabuf-v6-rfc16`. The lockdep
+annotation patch was intentionally left out so the discussion can focus on
+the lifetime and invalidation design.
 
 The messages were rewritten using Pavel's v5 series as the style reference.
 Straightforward fixes use one connected paragraph. Changes that introduce a
@@ -48,37 +48,34 @@ about later commits were removed.
    why acquiring the pin during map initialization closes that window.
 
 10. `dma-buf: split map pointer and DMA-active lifetimes`
-    Uses two paragraphs: the first explains why software ownership and active
-    DMA ownership differ; the second describes the kref, percpu_ref and RCU
-    roles.
+    Explains why pointer and DMA-map ownership need separate references. It
+    also makes clear that both references remain paired at import in this
+    preparatory patch, preserving the existing lifetime boundary.
 
-11. `dma-buf: signal the drain fence from the active release`
+11. `dma-buf: defer percpu_ref_exit() to the map's final release`
+    Prepares for late active acquisition by keeping percpu-ref storage valid
+    until the final software reference has been released.
+
+12. `nvme-pci: acquire dma-buf active references at submission`
+    Defines the reclaim cycle that requires moving the reference and identifies
+    the first driver DMA-map access as the new boundary. It also explains
+    setup-failure balancing and terminal batch handling.
+
+13. `dma-buf: signal the drain fence from the active release`
     Explains why the last active DMA reference is the correct fence-signalling
     point and separates it from deferred unmap.
 
-12. `dma-buf: initialise the drain fence after reserving its slot`
+14. `dma-buf: initialise the drain fence after reserving its slot`
     Uses one paragraph for the required reserve/init/publish ordering and one
     for the synchronous fallback when reservation fails.
 
-13. `dma-buf: run deferred unmap on a WQ_MEM_RECLAIM workqueue`
+15. `dma-buf: run deferred unmap on a WQ_MEM_RECLAIM workqueue`
     Removes reviewer attribution and states the reclaim-forward-progress
     concern and dedicated-workqueue solution directly.
 
-14. `io_uring/rsrc: re-import when the cached dma-buf map is stale`
+16. `io_uring/rsrc: re-import when the cached dma-buf map is stale`
     Uses one paragraph to describe how a request retains an old generation and
     a second to describe dropping it and importing the current generation.
-
-15. `nvme-pci: acquire dma-buf active references at submission`
-    Defines the reclaim cycle that requires moving the reference, identifies
-    the first driver DMA-map access as the new boundary, and records that only
-    non-reclaiming allocations occur until the reference is released. It also
-    explains setup-failure balancing and terminal batch handling. Code comments
-    were reduced to API constraints and assertions that are not obvious from
-    the control flow.
-
-16. `dma-buf: defer percpu_ref_exit() to the map's final release`
-    Explains why a stale software holder can still attempt an active tryget and
-    why percpu-ref storage must survive until final map release.
 
 All messages are wrapped for kernel style and retain matching
 `Anuj Gupta <anuj20.g@samsung.com>` author and Signed-off-by identities.

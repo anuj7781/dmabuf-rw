@@ -1,7 +1,7 @@
-From fefcf4a5a81c3b184fc0afa8924fd66e37a9eecf Mon Sep 17 00:00:00 2001
+From 0c5f88472af645cdcba0ee15fbd3fd935a75379d Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:40:08 +0530
-Subject: [PATCH 13/16] dma-buf: run deferred unmap on a WQ_MEM_RECLAIM
+Subject: [PATCH 15/16] dma-buf: run deferred unmap on a WQ_MEM_RECLAIM
  workqueue
 
 An exporter reclaiming the buffer can wait for the importer to unmap
@@ -11,7 +11,7 @@ system workqueue saturation cannot stall teardown.
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index 294cb8edef73..86ad8f848f96 100644
+index 4d70bf6a0f28..ca248cd1c5f5 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
 @@ -8,6 +8,9 @@
@@ -33,7 +33,7 @@ index 294cb8edef73..86ad8f848f96 100644
  }
  
  int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
-@@ -293,3 +296,12 @@ int dma_buf_io_ctx_create(struct file *file,
+@@ -291,3 +294,12 @@ int dma_buf_io_ctx_create(struct file *file,
  
  	return ret;
  }

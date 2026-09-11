@@ -1,7 +1,7 @@
-From 8e1156e884319d29050e1b3864c34a0fbf765f1f Mon Sep 17 00:00:00 2001
+From 6828063244f61cc552d748115d52f6c25b011000 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Fri, 11 Sep 2026 16:04:56 +0530
-Subject: [PATCH 12/16] dma-buf: initialise the drain fence after reserving its
+Subject: [PATCH 14/16] dma-buf: initialise the drain fence after reserving its
  slot
 
 Fence initialization must follow all reclaim-capable
@@ -14,7 +14,7 @@ users synchronously and unmap the attachment instead.
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index 9b83af8b88e3..294cb8edef73 100644
+index 0d56811c1e88..4d70bf6a0f28 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
 @@ -87,6 +87,11 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
@@ -52,7 +52,7 @@ index 9b83af8b88e3..294cb8edef73 100644
  		percpu_ref_exit(&map->active);
  		kref_put(&map->refs, __dma_buf_io_map_free);
  		ret = -EFAULT;
-@@ -190,16 +195,23 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+@@ -189,16 +194,22 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
  
  	ret = dma_resv_reserve_fences(dmabuf->resv, 1);
  	if (WARN_ON_ONCE(ret)) {
@@ -69,7 +69,6 @@ index 9b83af8b88e3..294cb8edef73 100644
 +		ctx->dev_ops->unmap(ctx, map);
 +		kfree(map->fence);
 +		map->fence = NULL;
-+		percpu_ref_exit(&map->active);
 +		kref_put(&map->refs, __dma_buf_io_map_free);
  		return;
  	}
@@ -82,7 +81,7 @@ index 9b83af8b88e3..294cb8edef73 100644
  	percpu_ref_kill(&map->active);
  }
 diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
-index 06686d8f266a..c0cc0b21e3f3 100644
+index 83162a7844cb..410ff5b3ce86 100644
 --- a/include/linux/dma-buf-io.h
 +++ b/include/linux/dma-buf-io.h
 @@ -2,6 +2,7 @@
@@ -105,7 +104,7 @@ index 06686d8f266a..c0cc0b21e3f3 100644
  struct dma_buf_io_ops {
  	/*
  	 * Create a new map for the given ctx. Called with the reservation
-@@ -45,7 +51,10 @@ struct dma_buf_io_map {
+@@ -46,7 +52,10 @@ struct dma_buf_io_map {
  	 */
  	unsigned			seg_shift;
  

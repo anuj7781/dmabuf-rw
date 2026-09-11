@@ -1,15 +1,16 @@
-From aa30cb2190f4a1e52b6b7fd587179a1a2f215f34 Mon Sep 17 00:00:00 2001
+From cfc98685f4c4b6e08eb6e5f85035e1019aa1ef5f Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Fri, 11 Sep 2026 14:18:22 +0530
 Subject: [PATCH 10/16] dma-buf: split map pointer and DMA-active lifetimes
 
-Software users can retain a map pointer while I/O preparation sleeps
-or allocates memory, but invalidation only needs to wait for users
-that can access the DMA mapping.
+The map refcount currently serves two purposes: it keeps the map pointer
+valid and prevents the DMA mapping from being torn down. These lifetimes
+need different boundaries because requests can retain a map pointer while
+preparing I/O without accessing the DMA mapping.
 
-Use a kref to protect the map and its context, and retain the
-percpu_ref as the gate for active DMA access. Free the map through
-RCU after all software references are gone.
+Use a kref to protect the map and its context, and retain the percpu_ref
+for active DMA-map access. Keep both references paired at import for now,
+so this patch does not change when invalidation can release the mapping.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 
@@ -121,7 +122,7 @@ index 382b896f2e1e..432cf97cf2ab 100644
  
  void dma_buf_io_invalidate_mappings(struct dma_buf_io_ctx *ctx)
 diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
-index 867709f84fc5..06686d8f266a 100644
+index 867709f84fc5..88c54af4a0be 100644
 --- a/include/linux/dma-buf-io.h
 +++ b/include/linux/dma-buf-io.h
 @@ -3,6 +3,8 @@
@@ -178,20 +179,25 @@ index 867709f84fc5..06686d8f266a 100644
  static inline struct dma_buf_io_map *
  dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
  {
-@@ -80,7 +98,7 @@ dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
+@@ -80,15 +98,20 @@ dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
  	guard(rcu)();
  
  	map = rcu_dereference(ctx->map);
 -	if (unlikely(!map || !percpu_ref_tryget_live_rcu(&map->refs)))
 +	if (unlikely(!map || !kref_get_unless_zero(&map->refs)))
++		return NULL;
++	if (unlikely(!dma_buf_io_map_active_tryget(map))) {
++		kref_put(&map->refs, __dma_buf_io_map_free);
  		return NULL;
++	}
  
  	return map;
-@@ -88,7 +106,7 @@ dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
+ }
  
  static inline void dma_buf_io_map_drop(struct dma_buf_io_map *map)
  {
 -	percpu_ref_put(&map->refs);
++	dma_buf_io_map_active_put(map);
 +	kref_put(&map->refs, __dma_buf_io_map_free);
  }
  

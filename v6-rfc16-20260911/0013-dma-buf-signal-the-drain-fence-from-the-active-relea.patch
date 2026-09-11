@@ -1,7 +1,7 @@
-From 772080cae118c7090453f7317f8f3b15660ff46c Mon Sep 17 00:00:00 2001
+From 553a66165e7e16c9352b56743bbe50e8f9b2a6ad Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:39:09 +0530
-Subject: [PATCH 11/16] dma-buf: signal the drain fence from the active release
+Subject: [PATCH 13/16] dma-buf: signal the drain fence from the active release
 
 The drain fence only needs to wait for active DMA users. Signal it
 directly when the last active reference is released, before deferred
@@ -10,10 +10,10 @@ unmap work is queued.
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index 432cf97cf2ab..9b83af8b88e3 100644
+index 8d5aeee376e0..0d56811c1e88 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
-@@ -74,13 +74,6 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+@@ -75,13 +75,6 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
  	struct dma_buf_io_ctx *ctx = map->ctx;
  	struct dma_buf *dmabuf = ctx->dmabuf;
  
@@ -36,7 +36,7 @@ index 432cf97cf2ab..9b83af8b88e3 100644
  	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
  	queue_work(system_wq, &map->release_work);
  }
-@@ -207,10 +200,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+@@ -206,10 +199,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
  	}
  
  	dma_resv_add_fence(dmabuf->resv, map->fence, DMA_RESV_USAGE_KERNEL);

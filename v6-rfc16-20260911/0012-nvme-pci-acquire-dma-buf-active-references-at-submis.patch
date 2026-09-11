@@ -1,7 +1,7 @@
-From 0a36ae3700da4eff3b14f59043b984a604922694 Mon Sep 17 00:00:00 2001
+From f288e9245fa47a620d9a5ffb4421ff6ab4cd3377 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:48:47 +0530
-Subject: [PATCH 15/16] nvme-pci: acquire dma-buf active references at
+Subject: [PATCH 12/16] nvme-pci: acquire dma-buf active references at
  submission
 
 A request currently acquires the map's active reference while io_uring
@@ -11,8 +11,8 @@ reclaim can wait for a request whose own allocation is entering reclaim.
 
 Keep the request's kref while it is being prepared, but acquire the active
 reference in nvme_rq_setup_dmabuf(), immediately before the first access to
-the driver DMA map. From there until the reference is released, the NVMe
-DMA-BUF path uses only non-reclaiming GFP_ATOMIC allocations.
+the driver DMA map. Request setup after that point uses only non-reclaiming
+GFP_ATOMIC allocations.
 
 Release the active reference on completion and on every setup failure. If
 invalidation wins the race, fail the request with BLK_STS_IOERR. Preserve
@@ -22,10 +22,10 @@ resource shortage and repeatedly requeueing the same stale generation.
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index 86ad8f848f96..a52386cdc964 100644
+index 8e1f36b43963..8d5aeee376e0 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
-@@ -173,7 +173,6 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+@@ -172,7 +172,6 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
  
  	/* Return a caller reference in addition to the publication reference. */
  	kref_get(&map->refs);
@@ -272,10 +272,10 @@ index 868524ca3575..5675fd28fbac 100644
  
  	if (nvmeq)
 diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
-index c0cc0b21e3f3..410ff5b3ce86 100644
+index 88c54af4a0be..83162a7844cb 100644
 --- a/include/linux/dma-buf-io.h
 +++ b/include/linux/dma-buf-io.h
-@@ -40,8 +40,9 @@ struct dma_buf_io_map {
+@@ -34,8 +34,9 @@ struct dma_buf_io_map {
  	struct kref			refs;
  
  	/*
@@ -287,7 +287,7 @@ index c0cc0b21e3f3..410ff5b3ce86 100644
  	 */
  	struct percpu_ref		active;
  
-@@ -99,6 +100,7 @@ static inline void dma_buf_io_map_active_put(struct dma_buf_io_map *map)
+@@ -90,6 +91,7 @@ static inline void dma_buf_io_map_active_put(struct dma_buf_io_map *map)
  	percpu_ref_put(&map->active);
  }
  
@@ -295,6 +295,24 @@ index c0cc0b21e3f3..410ff5b3ce86 100644
  static inline struct dma_buf_io_map *
  dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
  {
+@@ -100,17 +102,12 @@ dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
+ 	map = rcu_dereference(ctx->map);
+ 	if (unlikely(!map || !kref_get_unless_zero(&map->refs)))
+ 		return NULL;
+-	if (unlikely(!dma_buf_io_map_active_tryget(map))) {
+-		kref_put(&map->refs, __dma_buf_io_map_free);
+-		return NULL;
+-	}
+ 
+ 	return map;
+ }
+ 
+ static inline void dma_buf_io_map_drop(struct dma_buf_io_map *map)
+ {
+-	dma_buf_io_map_active_put(map);
+ 	kref_put(&map->refs, __dma_buf_io_map_free);
+ }
+ 
 -- 
 2.43.0
 
