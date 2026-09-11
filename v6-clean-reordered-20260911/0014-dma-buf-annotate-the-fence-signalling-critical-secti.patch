@@ -1,0 +1,106 @@
+From 7f7a71657ec87fb2289d791c59a80575c4e60f57 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 15:55:05 +0530
+Subject: [PATCH 14/15] dma-buf: annotate the fence signalling critical section
+
+Annotate the allocation-free fence signalling section so lockdep can validate the release path.
+
+Signed-off-by: Anuj Gupta <anuj1072538@gmail.com>
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index bbcb5212cf9e..67e6c1c36a50 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -8,6 +8,18 @@
+ #include <linux/dma-resv.h>
+ #include <linux/file.h>
+ 
++/*
++ * Dedicated so the unmap worker is never starved by system_wq saturation.
++ * An exporter's reclaim/eviction path can be waiting on this worker (via the
++ * drain fence or ->drain), and system_wq offers no forward-progress
++ * guarantee under memory pressure. WQ_UNBOUND: unmap work is not CPU-affine
++ * and must not queue up behind unrelated per-CPU bound work either.
++ *
++ * This addresses workqueue starvation only. It does not by itself make
++ * signalling the fence from a worker safe -- that is why the fence is
++ * signalled from dma_buf_io_map_active_release() (see the FENCED case
++ * there), not from work queued on this or any other workqueue.
++ */
+ static struct workqueue_struct *dma_buf_io_wq;
+ 
+ static const char *dma_buf_io_fence_drv_name(struct dma_fence *fence)
+@@ -40,6 +52,11 @@ static void dma_buf_io_ctx_destroy_work(struct work_struct *work)
+ 	fput(file);
+ }
+ 
++/*
++ * Drop a ctx reference, deferring the final free to a worker. Callers may be
++ * holding dma_resv, which ctx->dev_ops->release() -> dma_buf_detach() takes
++ * as well, so the free can never run inline from here.
++ */
+ static void dma_buf_io_ctx_put(struct dma_buf_io_ctx *ctx)
+ {
+ 	if (refcount_dec_and_test(&ctx->refs))
+@@ -75,7 +92,8 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ 	ctx->dev_ops->unmap(ctx, map);
+ 	dma_resv_unlock(dmabuf->resv);
+ 
+-		dma_fence_put(fence);
++	dma_fence_put(fence);
++	percpu_ref_exit(&map->active);
+ 	kref_put(&map->refs, __dma_buf_io_map_free);
+ }
+ 
+@@ -84,6 +102,24 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ 	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
+ 	bool cookie;
+ 
++	/*
++	 * The load-bearing claim of this design is that everything from
++	 * fence publication (dma_resv_add_fence() in dma_buf_io_drop_map())
++	 * up to this signal takes no lock and allocates nothing -- that is
++	 * what makes it safe to run from arbitrary context, including a
++	 * driver's hardware completion IRQ. That claim was previously only
++	 * asserted in comments. Annotate it so lockdep checks it on every
++	 * boot with CONFIG_PROVE_LOCKING, including on paths nobody thought
++	 * to test by hand (abort, cancellation, the various nvme
++	 * setup-failure rollbacks that call nvme_dmabuf_put_active()).
++	 *
++	 * This does NOT cover nvme's timeout/reset/PCI-recovery escalation,
++	 * which can also sit on the path to the last active put. Those paths
++	 * are shared with every non-dma-buf request nvme handles and are not
++	 * ours to place inside a fence signalling section; whether they stay
++	 * allocation-free is tracked separately as an open question, not
++	 * asserted here.
++	 */
+ 	cookie = dma_fence_begin_signalling();
+ 
+ 	if (map->release_mode == DMA_BUF_IO_RELEASE_SYNC) {
+@@ -118,6 +154,7 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+ 	kref_init(&map->refs);
+ 	init_completion(&map->drain);
+ 
++	/* Keep ctx alive until the map's final release. */
+ 	refcount_inc(&ctx->refs);
+ 	return 0;
+ }
+@@ -161,6 +198,7 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 		ctx->dev_ops->unmap(ctx, map);
+ 		/* The fence has not been initialized. */
+ 		kfree(map->fence);
++		percpu_ref_exit(&map->active);
+ 		kref_put(&map->refs, __dma_buf_io_map_free);
+ 		ret = -EFAULT;
+ 		goto out;
+@@ -168,6 +206,7 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 
+ 	/* Return a caller reference in addition to the publication reference. */
+ 	kref_get(&map->refs);
++	percpu_ref_get(&map->active);
+ 	rcu_assign_pointer(ctx->map, map);
+ out:
+ 	dma_resv_unlock(dmabuf->resv);
+-- 
+2.43.0
+

@@ -1,0 +1,81 @@
+From c57e0fd4d14b20609a6778a355ff95c7de270e66 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Fri, 11 Sep 2026 16:52:41 +0530
+Subject: [PATCH 15/15] dma-buf: defer active ref teardown until map release
+
+Keep the active reference usable while stale software map references drain, and release its percpu storage from the final RCU callback.
+
+Signed-off-by: Anuj Gupta <anuj1072538@gmail.com>
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index 67e6c1c36a50..3d213fae563b 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -68,6 +68,7 @@ static void dma_buf_io_map_free_rcu(struct rcu_head *rcu)
+ 	struct dma_buf_io_map *map = container_of(rcu, struct dma_buf_io_map, rcu);
+ 	struct dma_buf_io_ctx *ctx = map->ctx;
+ 
++	percpu_ref_exit(&map->active);
+ 	kfree(map);
+ 	dma_buf_io_ctx_put(ctx);
+ }
+@@ -93,7 +94,6 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ 	dma_resv_unlock(dmabuf->resv);
+ 
+ 	dma_fence_put(fence);
+-	percpu_ref_exit(&map->active);
+ 	kref_put(&map->refs, __dma_buf_io_map_free);
+ }
+ 
+@@ -102,24 +102,6 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ 	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
+ 	bool cookie;
+ 
+-	/*
+-	 * The load-bearing claim of this design is that everything from
+-	 * fence publication (dma_resv_add_fence() in dma_buf_io_drop_map())
+-	 * up to this signal takes no lock and allocates nothing -- that is
+-	 * what makes it safe to run from arbitrary context, including a
+-	 * driver's hardware completion IRQ. That claim was previously only
+-	 * asserted in comments. Annotate it so lockdep checks it on every
+-	 * boot with CONFIG_PROVE_LOCKING, including on paths nobody thought
+-	 * to test by hand (abort, cancellation, the various nvme
+-	 * setup-failure rollbacks that call nvme_dmabuf_put_active()).
+-	 *
+-	 * This does NOT cover nvme's timeout/reset/PCI-recovery escalation,
+-	 * which can also sit on the path to the last active put. Those paths
+-	 * are shared with every non-dma-buf request nvme handles and are not
+-	 * ours to place inside a fence signalling section; whether they stay
+-	 * allocation-free is tracked separately as an open question, not
+-	 * asserted here.
+-	 */
+ 	cookie = dma_fence_begin_signalling();
+ 
+ 	if (map->release_mode == DMA_BUF_IO_RELEASE_SYNC) {
+@@ -198,7 +180,6 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 		ctx->dev_ops->unmap(ctx, map);
+ 		/* The fence has not been initialized. */
+ 		kfree(map->fence);
+-		percpu_ref_exit(&map->active);
+ 		kref_put(&map->refs, __dma_buf_io_map_free);
+ 		ret = -EFAULT;
+ 		goto out;
+@@ -206,7 +187,6 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 
+ 	/* Return a caller reference in addition to the publication reference. */
+ 	kref_get(&map->refs);
+-	percpu_ref_get(&map->active);
+ 	rcu_assign_pointer(ctx->map, map);
+ out:
+ 	dma_resv_unlock(dmabuf->resv);
+@@ -239,7 +219,6 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 		ctx->dev_ops->unmap(ctx, map);
+ 		kfree(map->fence);
+ 		map->fence = NULL;
+-		percpu_ref_exit(&map->active);
+ 		kref_put(&map->refs, __dma_buf_io_map_free);
+ 		return;
+ 	}
+-- 
+2.43.0
+

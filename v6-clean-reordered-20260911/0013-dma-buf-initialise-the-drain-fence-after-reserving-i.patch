@@ -1,0 +1,54 @@
+From 1ae9d422538e0ffe97ff04162dc114152c36d9f4 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Fri, 11 Sep 2026 16:04:56 +0530
+Subject: [PATCH 13/15] dma-buf: initialise the drain fence after reserving its
+ slot
+
+A fence must be initialized only after reclaim-capable preparation is
+complete and dma_resv_reserve_fences() has reserved its slot. Allocate the
+fence storage with the map, but initialize it immediately before publishing
+it during invalidation.
+
+If reserving the slot fails, no fence can be published. Drain active users
+with a completion and unmap synchronously instead.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+
+diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
+index d02612b80f55..717c1a9a0032 100644
+--- a/include/linux/dma-buf-io.h
++++ b/include/linux/dma-buf-io.h
+@@ -2,6 +2,7 @@
+ #ifndef __DMA_BUF_IO_H__
+ #define __DMA_BUF_IO_H__
+ 
++#include <linux/completion.h>
+ #include <linux/dma-buf.h>
+ #include <linux/kref.h>
+ #include <linux/rcupdate.h>
+@@ -9,6 +10,11 @@
+ struct dma_buf_io_ctx;
+ struct dma_buf_io_map;
+ 
++enum dma_buf_io_release_mode {
++	DMA_BUF_IO_RELEASE_FENCED,
++	DMA_BUF_IO_RELEASE_SYNC,
++};
++
+ struct dma_buf_io_ops {
+ 	/*
+ 	 * Create a new map for the given ctx. Called with the reservation
+@@ -45,7 +51,10 @@ struct dma_buf_io_map {
+ 	 */
+ 	unsigned			seg_shift;
+ 
++	enum dma_buf_io_release_mode	release_mode;
++
+ 	struct work_struct		release_work;
++	struct completion		drain;
+ 	struct dma_fence		*fence;
+ 	struct dma_buf_io_ctx		*ctx;
+ 	struct rcu_head			rcu;
+-- 
+2.43.0
+
