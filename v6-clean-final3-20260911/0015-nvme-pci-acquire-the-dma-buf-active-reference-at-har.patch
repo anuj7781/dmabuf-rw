@@ -1,4 +1,4 @@
-From 75e6c9d10476e3883f81ccef683749267598eb5c Mon Sep 17 00:00:00 2001
+From db897b973783df1f5408d8034cee8140ad83a3f2 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:48:47 +0530
 Subject: [PATCH 15/17] nvme-pci: acquire the dma-buf active reference at
@@ -25,7 +25,7 @@ index 86ad8f848f96..a52386cdc964 100644
  out:
  	dma_resv_unlock(dmabuf->resv);
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
-index 868524ca3575..02f7ba10dbe7 100644
+index 868524ca3575..e553390bfc0c 100644
 --- a/drivers/nvme/host/pci.c
 +++ b/drivers/nvme/host/pci.c
 @@ -427,6 +427,12 @@ enum nvme_iod_flags {
@@ -212,23 +212,18 @@ index 868524ca3575..02f7ba10dbe7 100644
  	return BLK_STS_IOERR;
  }
  
-@@ -1432,6 +1495,15 @@ static blk_status_t nvme_rq_setup_dmabuf(struct request *req,
+@@ -1432,6 +1495,10 @@ static blk_status_t nvme_rq_setup_dmabuf(struct request *req,
  	unsigned int entries;
  	size_t avg_seg;
  
-+	/*
-+	 * Must be the first statement: nothing below may read driver DMA
-+	 * state (map->sgt, map->dma_list, ...) before this succeeds. See
-+	 * nvme_req_dmabuf_map()'s assertion and the ->active comment in
-+	 * include/linux/dma-buf-io.h.
-+	 */
++	/* Acquire the reference before accessing the DMA map. */
 +	if (!nvme_dmabuf_tryget_active(req))
 +		return NVME_STS_DMABUF_GENERATION_LOST;
 +
  	if (use_sgl == SGL_UNSUPPORTED)
  		return nvme_rq_setup_dmabuf_map(req, nvmeq);
  
-@@ -1695,6 +1767,14 @@ static blk_status_t nvme_prep_rq(struct request *req)
+@@ -1695,6 +1762,14 @@ static blk_status_t nvme_prep_rq(struct request *req)
  	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
  	blk_status_t ret;
  
@@ -243,19 +238,12 @@ index 868524ca3575..02f7ba10dbe7 100644
  	iod->flags = 0;
  	iod->nr_descriptors = 0;
  	iod->total_len = 0;
-@@ -1773,18 +1853,27 @@ static void nvme_submit_cmds(struct nvme_queue *nvmeq, struct rq_list *rqlist)
+@@ -1773,18 +1848,20 @@ static void nvme_submit_cmds(struct nvme_queue *nvmeq, struct rq_list *rqlist)
  	spin_unlock(&nvmeq->sq_lock);
  }
  
 -static bool nvme_prep_rq_batch(struct nvme_queue *nvmeq, struct request *req)
-+/*
-+ * Returns the actual blk_status_t from nvme_prep_rq() -- previously
-+ * collapsed to bool, which made every failure indistinguishable from a
-+ * resource shortage and therefore always requeued. A dma-buf
-+ * generation-loss rejection (NVME_STS_DMABUF_GENERATION_LOST) is terminal
-+ * and must not be requeued: requeuing re-runs nvme_prep_rq() against the
-+ * same dead map generation, which can only ever fail the same way again.
-+ */
++/* Preserve terminal preparation errors for batched requests. */
 +static blk_status_t nvme_prep_rq_batch(struct nvme_queue *nvmeq,
 +				       struct request *req)
  {
@@ -275,7 +263,7 @@ index 868524ca3575..02f7ba10dbe7 100644
  }
  
  static void nvme_queue_rqs(struct rq_list *rqlist)
-@@ -1795,14 +1884,37 @@ static void nvme_queue_rqs(struct rq_list *rqlist)
+@@ -1795,14 +1872,26 @@ static void nvme_queue_rqs(struct rq_list *rqlist)
  	struct request *req;
  
  	while ((req = rq_list_pop(rqlist))) {
@@ -297,18 +285,7 @@ index 868524ca3575..02f7ba10dbe7 100644
  			rq_list_add_tail(&requeue_list, req);
 +			break;
 +		default:
-+			/*
-+			 * Terminal failure (including
-+			 * NVME_STS_DMABUF_GENERATION_LOST): end the request
-+			 * now rather than requeue it. Requeuing here would
-+			 * loop it through nvme_queue_rqs() indefinitely
-+			 * against the same generation, since nothing about a
-+			 * terminal failure changes by retrying. No need to
-+			 * flush submit_list first -- ending this request
-+			 * doesn't interact with the unrelated ones already
-+			 * prepared for this nvmeq; they still flush at the
-+			 * normal points (nvmeq switch or loop exit).
-+			 */
++			/* Generation loss is terminal, not a resource retry. */
 +			blk_mq_end_request(req, ret);
 +			break;
 +		}
