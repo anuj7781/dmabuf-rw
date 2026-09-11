@@ -1,0 +1,103 @@
+From a11729f25d08ba9d320852b50a91187030c8a494 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 15:41:20 +0530
+Subject: [PATCH 14/17] io_uring/rsrc: re-import when the cached dma-buf map is
+ stale
+
+io_import_dmabuf(), added by patch 15 of "Add dmabuf read/write via
+io_uring", caches the imported map in req->dmabuf_map and sets
+REQ_F_DROP_DMABUF so a later call for the same request (reissue, or a
+second bio built from a split) can skip re-deriving the map:
+
+	if (req->flags & REQ_F_DROP_DMABUF) {
+		map = req->dmabuf_map;
+		goto init_iter;
+	}
+
+That reuse has no liveness check. dma-buf maps are dynamically revocable
+-- the exporter can invalidate the current generation and the driver can
+publish a new one on db->ctx.map between this request's first import and
+a later reissue that hits this fast path. The cached pointer stays valid
+memory (the request's own software reference keeps the struct allocated
+by design), but it can point at a generation whose DMA mapping is being
+or has already been torn down, and this path would hand it straight to
+iov_iter_dmabuf_map() and on to hardware submission.
+
+Add io_dmabuf_reuse_map(), which compares the cached pointer against the
+ctx's current map before reusing it. On a mismatch, drop the stale
+reference and clear REQ_F_DROP_DMABUF so the caller falls through to a
+normal re-import. The comparison needs no RCU read-side protection: the
+request already holds its own kref on the cached map, so that memory
+cannot be freed and reused for a different generation out from under the
+comparison, and only addresses are compared, never the pointee.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+
+diff --git a/io_uring/rsrc.c b/io_uring/rsrc.c
+index 5074b1e4b050..f27eb3d0ebcc 100644
+--- a/io_uring/rsrc.c
++++ b/io_uring/rsrc.c
+@@ -1280,6 +1280,39 @@ void io_drop_dmabuf_node(struct io_kiocb *req)
+ 	req->flags &= ~REQ_F_DROP_DMABUF;
+ }
+ 
++/*
++ * req->dmabuf_map, held via REQ_F_DROP_DMABUF, can be a stale generation:
++ * the exporter may invalidate and the driver may republish a new map on
++ * db->ctx between this request's first import and a later reissue that
++ * reuses the cached pointer. The map's own software reference keeps the
++ * struct itself alive either way (see dma_buf_io_map_drop()), but a stale
++ * generation's DMA mapping is being (or has been) torn down and must not be
++ * submitted to hardware.
++ *
++ * Pointer comparison against ctx->map is sufficient without RCU read-side
++ * protection: we already hold our own kref on @map, so its memory cannot be
++ * freed and reused for a different generation out from under this
++ * comparison, and we are only comparing addresses, never dereferencing
++ * ctx->map's pointee.
++ *
++ * Returns the still-current map, or NULL if it was stale -- in which case
++ * the stale software reference has already been dropped and
++ * REQ_F_DROP_DMABUF cleared, so the caller can proceed to a normal
++ * re-import.
++ */
++static struct dma_buf_io_map *io_dmabuf_reuse_map(struct io_kiocb *req,
++						  struct io_regbuf_dma *db)
++{
++	struct dma_buf_io_map *map = req->dmabuf_map;
++
++	if (likely(rcu_access_pointer(db->ctx.map) == map))
++		return map;
++
++	dma_buf_io_map_drop(map);
++	req->flags &= ~REQ_F_DROP_DMABUF;
++	return NULL;
++}
++
+ static int io_import_dmabuf(struct io_kiocb *req,
+ 			   int ddir, struct iov_iter *iter,
+ 			   struct io_mapped_ubuf *imu,
+@@ -1287,7 +1320,7 @@ static int io_import_dmabuf(struct io_kiocb *req,
+ 			   unsigned issue_flags)
+ {
+ 	struct io_regbuf_dma *db = imu->priv;
+-	struct dma_buf_io_map *map;
++	struct dma_buf_io_map *map = NULL;
+ 
+ 	if (!IS_ENABLED(CONFIG_DMA_SHARED_BUFFER))
+ 		return -EOPNOTSUPP;
+@@ -1297,8 +1330,9 @@ static int io_import_dmabuf(struct io_kiocb *req,
+ 		return -EBADF;
+ 
+ 	if (req->flags & REQ_F_DROP_DMABUF) {
+-		map = req->dmabuf_map;
+-		goto init_iter;
++		map = io_dmabuf_reuse_map(req, db);
++		if (map)
++			goto init_iter;
+ 	}
+ 
+ 	map = dma_buf_io_get_map(&db->ctx);
+-- 
+2.43.0
+
