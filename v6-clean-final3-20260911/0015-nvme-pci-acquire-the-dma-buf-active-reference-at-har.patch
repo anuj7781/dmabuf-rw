@@ -1,4 +1,4 @@
-From 2616eea2e6bf788c563b5054d6b04193aa5afac1 Mon Sep 17 00:00:00 2001
+From 75e6c9d10476e3883f81ccef683749267598eb5c Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:48:47 +0530
 Subject: [PATCH 15/17] nvme-pci: acquire the dma-buf active reference at
@@ -6,7 +6,9 @@ Subject: [PATCH 15/17] nvme-pci: acquire the dma-buf active reference at
 
 Acquire the dma-buf active reference at NVMe hardware submission.
 
-Release it on completion or setup failure, and preserve terminal generation-loss status in batched requests.
+Release it on completion or setup failure.
+
+Preserve terminal generation-loss status in batched requests.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 
