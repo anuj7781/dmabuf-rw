@@ -1,4 +1,4 @@
-From 2d2f7c2181a590cf8ae1939b6fe37d801ca52e3c Mon Sep 17 00:00:00 2001
+From aa30cb2190f4a1e52b6b7fd587179a1a2f215f34 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Fri, 11 Sep 2026 14:18:22 +0530
 Subject: [PATCH 10/16] dma-buf: split map pointer and DMA-active lifetimes
@@ -14,7 +14,7 @@ RCU after all software references are gone.
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index 7747a3a1738f..432cf97cf2ab 100644
+index 382b896f2e1e..432cf97cf2ab 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
 @@ -49,6 +49,23 @@ static void dma_buf_io_ctx_put(struct dma_buf_io_ctx *ctx)
@@ -77,7 +77,7 @@ index 7747a3a1738f..432cf97cf2ab 100644
  	map->ctx = ctx;
 +	kref_init(&map->refs);
  
--	/* Keep ctx alive through deferred map teardown. */
+-	/* The map owns a ctx reference until deferred teardown completes. */
 +	/* Keep ctx alive until the map's final release. */
  	refcount_inc(&ctx->refs);
  	return 0;

@@ -1,16 +1,20 @@
-From 52f9e028024dfb44238716bfdd4b58197d4241ab Mon Sep 17 00:00:00 2001
+From 6e18d9f1223b6741d41e8d9622ccbdc8ed22485d Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Fri, 11 Sep 2026 14:14:36 +0530
-Subject: [PATCH 09/16] dma-buf: pin I/O contexts while releasing their maps
+Subject: [PATCH 09/16] dma-buf: pin I/O contexts for map teardown
 
-The release worker previously checked the context refcount before
-incrementing it, leaving a check-then-increment race. Pin the context
-when the map is initialized and drop the pin after the map is released.
+Map teardown runs asynchronously and dereferences its I/O context. Taking
+the context reference from the release worker is too late. Another thread
+can drop the final reference between the worker's refcount check and
+increment, allowing the context to be destroyed under the worker.
+
+Take the context reference when the map is initialized and release it after
+map teardown completes.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index d0494212fa84..7747a3a1738f 100644
+index d0494212fa84..382b896f2e1e 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
 @@ -57,13 +57,6 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
@@ -32,7 +36,7 @@ index d0494212fa84..7747a3a1738f 100644
  	map->fence = fence;
  	map->ctx = ctx;
 +
-+	/* Keep ctx alive through deferred map teardown. */
++	/* The map owns a ctx reference until deferred teardown completes. */
 +	refcount_inc(&ctx->refs);
  	return 0;
  }

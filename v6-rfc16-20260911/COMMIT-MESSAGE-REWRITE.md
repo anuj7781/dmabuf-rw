@@ -42,9 +42,10 @@ about later commits were removed.
 8. `nvme-pci: unwind DMA-BUF map creation failures`
    Describes the NVMe validation failure and its matching driver cleanup.
 
-9. `dma-buf: pin I/O contexts while releasing their maps`
-   Explains the check-then-increment race and why taking the pin during map
-   initialization closes it.
+9. `dma-buf: pin I/O contexts for map teardown`
+   Spells out the exact race: the final context reference can be dropped
+   between the release worker's refcount check and increment. It then explains
+   why acquiring the pin during map initialization closes that window.
 
 10. `dma-buf: split map pointer and DMA-active lifetimes`
     Uses two paragraphs: the first explains why software ownership and active
@@ -67,10 +68,13 @@ about later commits were removed.
     Uses one paragraph to describe how a request retains an old generation and
     a second to describe dropping it and importing the current generation.
 
-15. `nvme-pci: acquire the dma-buf active reference at hardware submission`
-    Explains why the reference moves into the NVMe submission path, how every
-    exit balances it and why generation loss remains terminal in the batch
-    path. Large code-comment narratives were reduced to local invariants.
+15. `nvme-pci: acquire dma-buf active references at submission`
+    Defines the reclaim cycle that requires moving the reference, identifies
+    the first driver DMA-map access as the new boundary, and records that only
+    non-reclaiming allocations occur until the reference is released. It also
+    explains setup-failure balancing and terminal batch handling. Code comments
+    were reduced to API constraints and assertions that are not obvious from
+    the control flow.
 
 16. `dma-buf: defer percpu_ref_exit() to the map's final release`
     Explains why a stale software holder can still attempt an active tryget and
