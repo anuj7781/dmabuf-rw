@@ -1,7 +1,7 @@
 From 0c1217db9b22f68259e3e3259ff2432209599b1c Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 14:52:49 +0530
-Subject: [PATCH 04/19] dma-buf: wait for fences under the reservation lock
+Subject: [PATCH 04/18] dma-buf: wait for fences under the reservation lock
 
 Keep the reservation lock held from the fence wait through map creation,
 so a new fence cannot be installed between them.
@@ -58,3 +58,6 @@ index fbf91db5617e..0821f740681a 100644
  
  	map = ctx->dev_ops->map(ctx);
  	if (IS_ERR(map)) {
+-- 
+2.43.0
+

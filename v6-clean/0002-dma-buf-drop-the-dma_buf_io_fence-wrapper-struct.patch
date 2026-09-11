@@ -1,7 +1,7 @@
 From 1e2f562ed8d0c1395d0ec743aa791689e89d40fa Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 14:51:08 +0530
-Subject: [PATCH 02/19] dma-buf: drop the dma_buf_io_fence wrapper struct
+Subject: [PATCH 02/18] dma-buf: drop the dma_buf_io_fence wrapper struct
 
 Use dma_fence's inline lock instead of a wrapper.
 
@@ -118,3 +118,6 @@ index d4f25c00bdc6..591fba5a675a 100644
  	struct dma_buf_io_ctx		*ctx;
  };
  
+-- 
+2.43.0
+

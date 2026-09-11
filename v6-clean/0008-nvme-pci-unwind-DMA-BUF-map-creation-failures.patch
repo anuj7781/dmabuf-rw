@@ -1,7 +1,7 @@
 From 459aa2695d0e361c3baaf956849a3285a24eb2b5 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:33:09 +0530
-Subject: [PATCH 08/19] nvme-pci: unwind DMA-BUF map creation failures
+Subject: [PATCH 08/18] nvme-pci: unwind DMA-BUF map creation failures
 
 Release the attachment mapping and map allocation when the DMA segment
 size is invalid.
@@ -28,3 +28,6 @@ index 67e26d6e8f25..868524ca3575 100644
  
  	ret = dma_buf_io_init_map(ctx, &map->base);
  	if (ret)
+-- 
+2.43.0
+

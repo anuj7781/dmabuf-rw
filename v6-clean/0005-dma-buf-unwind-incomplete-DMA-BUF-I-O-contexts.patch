@@ -1,7 +1,7 @@
 From e78f85d4ec9dd46b6cde781039fe96ba53b55eb5 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 14:54:52 +0530
-Subject: [PATCH 05/19] dma-buf: unwind incomplete DMA-BUF I/O contexts
+Subject: [PATCH 05/18] dma-buf: unwind incomplete DMA-BUF I/O contexts
 
 Release driver state and drop the dma-buf reference before failing an
 incomplete ops table.
@@ -30,3 +30,6 @@ index 0821f740681a..81f5e5cf60c1 100644
  
  	return ret;
  }
+-- 
+2.43.0
+

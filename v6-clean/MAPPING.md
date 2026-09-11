@@ -1,4 +1,4 @@
-# Mapping: `anuj/dmabuf-v6-lifetime` (6 commits) -> `anuj/dmabuf-v6-clean` (19 commits)
+# Mapping: `anuj/dmabuf-v6-lifetime` (6 commits) -> `anuj/dmabuf-v6-clean` (18 commits)
 
 Old branch, discovery-ordered:
 
@@ -24,23 +24,26 @@ head (`71c75106fd3c`) rather than on old commit 1:
 | 8 | `nvme-pci: unwind DMA-BUF map creation failures` | new -- v5 bug found while rewriting commit 2's territory: nvme's `->map()` had the same missing-unwind shape as commit 3 above |
 | 9 | `dma-buf: pin I/O contexts while releasing their maps` | 1 (the ctx-pin-timing half only: unconditional `refcount_inc()` in `dma_buf_io_init_map()`, replacing the check-then-increment TOCTOU Christian flagged on v4 -- still v5's original single `percpu_ref`, no kref/active split yet) |
 | 10 | `dma-buf: split map pointer and DMA-active lifetimes` | 1 (the kref/active split and RCU-delayed free) -- **redesigned**; see below |
-| 11 | `dma-buf: do not leak ctx on ctx_release_work's WARN_ON_ONCE paths` | 3 (the teardown-WARN leak half) -- placed after commit 10; see "Ordering fix" below |
-| 12 | `dma-buf: signal the drain fence from the active release` | 1 (signal as soon as active users drain instead of making signalling depend on the unmap worker) |
-| 13 | `dma-buf: initialise the drain fence after reserving its slot` | 1 (the fence-ordering half: delay `dma_fence_init()` until after `dma_resv_reserve_fences()`, with a synchronous fallback when reservation fails) |
-| 14 | `dma-buf: run deferred unmap on a WQ_MEM_RECLAIM workqueue` | 1 (the dedicated workqueue half, landed after signalling was removed from the worker in 12) |
-| 15 | `io_uring/rsrc: re-import when the cached dma-buf map is stale` | 3 (the `io_dmabuf_reuse_map()` half) |
-| 16 | `nvme-pci: acquire the dma-buf active reference at hardware submission` | 2 + 4 (active-ref funnel, `nvme_iod::flags` widened to `u16` in the same commit that adds `IOD_DMABUF_ACTIVE` rather than as a separate follow-up fixing a bug that commit itself introduced, setup-failure rollback, **and** the io_uring-side removal of the import-time active acquisition -- old commit 2 never did this half, leaving the reference double-acquired until this rewrite) |
-| 17 | `nvme-pci: end terminal dma-buf failures instead of requeuing them` | 2 (the `nvme_prep_rq_batch()`/`nvme_queue_rqs()` batch-status half) |
-| 18 | `dma-buf: defer percpu_ref_exit() to the map's final release` | new territory, not attempted on the old branch -- with active-ref acquisition decoupled from import (16), a kref-holding request can attempt a fresh `active_tryget()` after `percpu_ref_exit()` has already run, in **both** the FENCED worker and the SYNC fallback path |
-| 19 | `dma-buf: annotate the fence signalling critical section` | new -- `dma_fence_begin/end_signalling()` around the release callback, with the commit message explicit that nvme's timeout/reset/PCI-recovery escalation is *not* covered |
+| 11 | `dma-buf: signal the drain fence from the active release` | 1 (signal as soon as active users drain instead of making signalling depend on the unmap worker) |
+| 12 | `dma-buf: initialise the drain fence after reserving its slot` | 1 (the fence-ordering half: delay `dma_fence_init()` until after `dma_resv_reserve_fences()`, with a synchronous fallback when reservation fails) |
+| 13 | `dma-buf: run deferred unmap on a WQ_MEM_RECLAIM workqueue` | 1 (the dedicated workqueue half, landed after signalling was removed from the worker in 11) |
+| 14 | `io_uring/rsrc: re-import when the cached dma-buf map is stale` | 3 (the `io_dmabuf_reuse_map()` half) |
+| 15 | `nvme-pci: acquire the dma-buf active reference at hardware submission` | 2 + 4 (active-ref funnel, `nvme_iod::flags` widened to `u16` in the same commit that adds `IOD_DMABUF_ACTIVE` rather than as a separate follow-up fixing a bug that commit itself introduced, setup-failure rollback, **and** the io_uring-side removal of the import-time active acquisition -- old commit 2 never did this half, leaving the reference double-acquired until this rewrite) |
+| 16 | `nvme-pci: end terminal dma-buf failures instead of requeuing them` | 2 (the `nvme_prep_rq_batch()`/`nvme_queue_rqs()` batch-status half) |
+| 17 | `dma-buf: defer percpu_ref_exit() to the map's final release` | new territory, not attempted on the old branch -- with active-ref acquisition decoupled from import (15), a kref-holding request can attempt a fresh `active_tryget()` after `percpu_ref_exit()` has already run, in **both** the FENCED worker and the SYNC fallback path |
+| 18 | `dma-buf: annotate the fence signalling critical section` | new -- `dma_fence_begin/end_signalling()` around the release callback, with the commit message explicit that nvme's timeout/reset/PCI-recovery escalation is *not* covered |
 
 ## Not carried forward as separate commits
 
 - **`IOD_FLAGS_LAST` sentinel + `BUILD_BUG_ON`** (old commit 4): folded into
-  new commit 16. In a correctly-ordered history there is no moment where
+  new commit 15. In a correctly-ordered history there is no moment where
   `nvme_iod::flags` is deliberately too narrow, so there is nothing for a
   standalone "widen" commit to fix -- the field is declared `u16` in the same
   commit that introduces the bit needing it.
+- **The teardown-WARN leak half of old commit 3** (`dma_buf_io_ctx_release_work()`'s
+  two `WARN_ON_ONCE` paths returning without dropping the reference): drafted,
+  landed, then dropped again. See "Dropped: the ctx-teardown WARN-leak fix"
+  below -- it does not belong in this series.
 
 ## Redesign: commit 10's map-ctx lifetime invariant (Codex)
 
@@ -66,7 +69,7 @@ Verified before implementing:
 - The synchronous reserve-failure fallback drops exactly one publication
   kref and leaves the ctx pin for the RCU callback -- no direct
   `dma_buf_io_ctx_put()` call remains in that path.
-- After the nvme boundary-move commit (16), any code holding a kref on a
+- After the nvme boundary-move commit (15), any code holding a kref on a
   map can rely on `map->ctx` without a separate pin of its own -- this
   retroactively covers the `map->ctx` dereference in
   `nvme_ns_head_submit_bio()` (the local multipath commit, out of scope
@@ -105,40 +108,69 @@ than kept "for robustness". `nvme_dma_buf_io_ops` no longer has a
 `.free_map` entry, and `dma_buf_io_ctx_create()`'s ops-completeness check
 no longer requires one.
 
-## Ordering fix: commit 11 was originally placed before commit 10
+## Split: commit 12 (fence ordering) into 11 and 12
 
-Earlier still, the ctx-teardown WARN-leak fix (now commit 11) sat at
-position 8, grouped with the other ctx-lifetime-hardening commits (6, 7),
-*before* the map-lifetime split. That was wrong, caught by review, not by
-the build or checkpatch.
+The original fence-ordering commit bundled two things: moving
+`dma_fence_signal()` out of the unmap worker and into the active-release
+callback (a standalone, correctness-neutral relocation -- legal on its own
+per the two-stage invalidation contract, which explicitly permits
+signal-before-unmap), and the actual ordering fix (`dma_fence_init()`
+moved past `dma_resv_reserve_fences()`, plus the synchronous
+reserve-failure fallback that fix requires). Split into commit 11 (the
+relocation, ~2 lines) and commit 12 (the ordering fix and fallback, ~29
+added lines instead of ~90), matching the one-concern-per-commit
+granularity used throughout this series.
 
-`dma_buf_io_ctx_release_work()`'s fix unconditionally falls through to
-`dma_buf_io_ctx_put(ctx)` even when its two `WARN_ON_ONCE` checks fire. One
-of those checks, `ctx->map` still being non-NULL, is genuinely reachable:
-nothing marks `ctx` as closing to new imports, so a concurrent
-`dma_buf_io_create_map()` can republish a fresh map between `drop_map()`'s
-unlock and the wait returning. Falling through safely in that case depends
-on the live map holding its own pin on `ctx`, which only exists once
-commit 9 (and, for the full duration, commit 10) has landed. Before that,
-falling through to `dma_buf_io_ctx_put()` when a map is still present
-could destroy `ctx` while that map's worker still needs it -- the exact
-use-after-free class this whole series exists to eliminate, reintroduced
-into an intermediate commit by the reordering exercise itself.
+## Dropped: the ctx-teardown WARN-leak fix
 
-Fixed by moving the commit to its current position, after the full
-map-lifetime redesign (10), and rewriting its message to state the
-dependency explicitly rather than assert "cannot happen" without the
-invariant that makes it true. See commit 11's message for the full
-reasoning, including the proof that the *other* `WARN_ON_ONCE` (`ret <=
-0`) is unreachable for this series' own fence regardless of ordering
-(`dma_resv_wait_timeout()` is called with `intr=false` and
-`timeout=MAX_SCHEDULE_TIMEOUT`, and the fence never implements a custom
-`->wait`, so `dma_fence_default_wait()` cannot return before the fence
-signals).
+A commit correcting `dma_buf_io_ctx_release_work()`'s two `WARN_ON_ONCE`
+paths (which return early, leaking `ctx`, its `dma_buf` reference, the
+driver attachment, and the target file) was drafted, placed after commit
+10 so it could rely on that commit's ctx-pin invariant, built, and passed
+checkpatch and W=1 -- then dropped again after further review (Codex),
+for two independent reasons that both survived direct verification against
+the code rather than being taken on assertion:
+
+1. **The scenario the fix addresses is not reachable for the only current
+   consumer.** `ctx->map` being non-NULL at that point would require a
+   concurrent `dma_buf_io_create_map()` to republish a map after
+   `dma_buf_io_drop_map()`'s unlock. For io_uring, this is excluded by
+   construction: `io_find_buf_node()` increments `io_rsrc_node::refs`
+   under `io_ring_submit_lock()`, which guarantees `ctx->uring_lock` is
+   held; `io_put_rsrc_node()` asserts the same lock before decrementing.
+   Both directions of that refcount are serialized by one mutex, and a
+   request must hold an incremented reference *before* it can reach
+   `dma_buf_io_create_map()` -- the same increment that would prevent the
+   refcount from ever reaching zero. `io_release_reg_dmabuf()` (hence
+   `dma_buf_io_ctx_release()`) therefore cannot fire while any request
+   could still be importing through this ctx.
+2. **Even granting the race hypothetically (a future consumer, or a
+   locking change), the fix does not make it correct.** If a new map were
+   published concurrently, falling through to `dma_buf_io_ctx_put()`
+   avoids the immediate UAF only because the new map holds its own pin on
+   `ctx` (from commit 10). But nothing ever calls `dma_buf_io_drop_map()`
+   on that map again -- `ctx_release()` does not run twice -- so its
+   `active` reference is never killed, `unmap()` never runs, and its
+   eventual `kfree()` (once its last kref drops) would happen without
+   ever having been unmapped, violating the very invariant commit 10 was
+   verified against. It also trades a loud failure (`WARN_ON_ONCE` firing,
+   ctx and its resources leaking visibly) for a silent one (ctx and an
+   orphaned, never-invalidated map leaking indefinitely with nothing in
+   dmesg to point at). That is a worse outcome, not a fix.
+
+If concurrent map creation during ctx teardown ever needs to be a
+supported operation, the correct design is an explicit closing state
+(`ctx->closing`, set under `dma_resv` alongside unpublishing the current
+map, checked by `dma_buf_io_create_map()` before publishing a new one) --
+a real feature addition, out of scope for a series correcting v5/v4
+defects. Until then, `dma_buf_io_ctx_release_work()` is left at its
+original v5 shape: `WARN_ON_ONCE` and return, leaking on a condition the
+current consumer cannot reach and a future one should not silently paper
+over.
 
 ## Known divergence from the old branch (intentional)
 
-- Commit 16 removes the import-time `percpu_ref_get()`/`tryget()` calls
+- Commit 15 removes the import-time `percpu_ref_get()`/`tryget()` calls
   from `dma_buf_io_get_map()` / `dma_buf_io_create_map()` in the same diff
   that adds nvme's submission-time acquisition. The old branch's commit 2
   never did this -- on `anuj/dmabuf-v6-lifetime`, `map->active` is
@@ -151,14 +183,16 @@ signals).
   `anuj/dmabuf-v6-lifetime`'s tip any more -- the redesign is a deliberate
   improvement past what that branch has, not a reordering of the same
   content. See "Verification" below for what was actually checked instead.
+- The old branch's commit 3 includes the ctx-teardown WARN-leak fix; this
+  branch deliberately does not carry it. See "Dropped" above.
 
 ## Verification
 
-- All 19 commits build clean at `W=1` (`drivers/dma-buf/dma-buf-io.o`,
+- All 18 commits build clean at `W=1` (`drivers/dma-buf/dma-buf-io.o`,
   `drivers/nvme/host/pci.o`, `io_uring/rsrc.o`), verified individually via
   `git rebase --exec`, and pass `checkpatch.pl --strict` with 0
-  errors/warnings/checks, all re-run after the commit 9/10 redesign and the
-  commit 11 reorder.
+  errors/warnings/checks -- re-run after the commit 9/10 redesign, the
+  commit 11/12 split, and again after dropping the WARN-leak fix.
 - Full `make W=1 drivers/dma-buf/dma-buf-io.o drivers/nvme/host/pci.o
   io_uring/rsrc.o` at the tip: clean.
 - `include/linux/dma-buf-io.h` differs from `anuj/dmabuf-v6-lifetime` only

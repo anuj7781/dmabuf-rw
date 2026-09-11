@@ -1,7 +1,7 @@
 From aaa96d1d1a3284a43e5d3b45fa2213c02713c699 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 14:48:29 +0530
-Subject: [PATCH 01/19] dma-buf: document dma_buf_io_map::seg_shift
+Subject: [PATCH 01/18] dma-buf: document dma_buf_io_map::seg_shift
 
 Document the segment-length granularity used to split opaque dma-buf bios.
 
@@ -26,3 +26,6 @@ index f31c7375ae91..d4f25c00bdc6 100644
  	unsigned			seg_shift;
  
  	struct work_struct		release_work;
+-- 
+2.43.0
+

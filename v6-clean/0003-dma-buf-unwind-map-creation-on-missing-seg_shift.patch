@@ -1,7 +1,7 @@
 From 68853bb3112f591b234ef944d2ae04f37542f083 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 14:52:12 +0530
-Subject: [PATCH 03/19] dma-buf: unwind map creation on missing seg_shift
+Subject: [PATCH 03/18] dma-buf: unwind map creation on missing seg_shift
 
 Release map resources and the reservation lock when ->map() returns
 without setting seg_shift.
@@ -32,3 +32,6 @@ index 6834a79700ce..fbf91db5617e 100644
  
  	percpu_ref_get(&map->refs);
  	rcu_assign_pointer(ctx->map, map);
+-- 
+2.43.0
+

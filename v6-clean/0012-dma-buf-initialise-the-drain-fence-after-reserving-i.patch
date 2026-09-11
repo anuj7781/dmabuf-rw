@@ -1,7 +1,7 @@
-From 3ce8aa2dba96d2a41bd830335049688bc9835b09 Mon Sep 17 00:00:00 2001
+From 4fc9af54bcffb6dc9655e097c191b2f6391a2172 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Fri, 11 Sep 2026 16:04:56 +0530
-Subject: [PATCH 13/19] dma-buf: initialise the drain fence after reserving its
+Subject: [PATCH 12/18] dma-buf: initialise the drain fence after reserving its
  slot
 
 A fence must be initialized only after reclaim-capable preparation is
@@ -19,7 +19,7 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  2 files changed, 29 insertions(+), 8 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index 19ee83328487..b4c67ed82b9d 100644
+index 9b83af8b88e3..294cb8edef73 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
 @@ -87,6 +87,11 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
@@ -121,3 +121,6 @@ index 06686d8f266a..c0cc0b21e3f3 100644
  	struct dma_fence		*fence;
  	struct dma_buf_io_ctx		*ctx;
  	struct rcu_head			rcu;
+-- 
+2.43.0
+

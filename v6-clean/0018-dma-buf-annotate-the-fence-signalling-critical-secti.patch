@@ -1,7 +1,7 @@
-From c387648fc2a0909039f24b049766004c744ff767 Mon Sep 17 00:00:00 2001
+From 26611cdafa795e603a2b43aa5da0031c3093fca0 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:55:05 +0530
-Subject: [PATCH 19/19] dma-buf: annotate the fence signalling critical section
+Subject: [PATCH 18/18] dma-buf: annotate the fence signalling critical section
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -41,7 +41,7 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  1 file changed, 26 insertions(+), 4 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index b99fb6a00b4b..ac17099037ac 100644
+index 4b32ca7997b8..aa9a0c58ac81 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
 @@ -104,15 +104,37 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
@@ -86,3 +86,6 @@ index b99fb6a00b4b..ac17099037ac 100644
  }
  
  int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+-- 
+2.43.0
+

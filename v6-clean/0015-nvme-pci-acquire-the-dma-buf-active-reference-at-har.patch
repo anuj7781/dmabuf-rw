@@ -1,7 +1,7 @@
-From 801cb49886873b5da153e57174da8582a768e805 Mon Sep 17 00:00:00 2001
+From eae622f14b8aa54f84c285dafab0a8ab3c04386f Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:48:47 +0530
-Subject: [PATCH 16/19] nvme-pci: acquire the dma-buf active reference at
+Subject: [PATCH 15/18] nvme-pci: acquire the dma-buf active reference at
  hardware submission
 
 Wire nvme into map->active, taken and dropped at the actual hardware
@@ -88,7 +88,7 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  3 files changed, 162 insertions(+), 12 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index 4a7363638b3e..e2d6b765ce30 100644
+index 51d46baba107..aaf1974aa459 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
 @@ -184,7 +184,6 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
@@ -418,3 +418,6 @@ index c0cc0b21e3f3..717c1a9a0032 100644
  static inline struct dma_buf_io_map *
  dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
  {
+-- 
+2.43.0
+

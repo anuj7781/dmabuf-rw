@@ -1,7 +1,7 @@
-From 32bd5fefd3ff4ee650e9deaa9eb247f7a7f5dab4 Mon Sep 17 00:00:00 2001
+From 4d3d1a9ba7f0863337b072ac70bd90ac81327c09 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:39:09 +0530
-Subject: [PATCH 12/19] dma-buf: signal the drain fence from the active release
+Subject: [PATCH 11/18] dma-buf: signal the drain fence from the active release
 
 Signal the fence as soon as the last active user is gone, before queuing
 the worker that locks dma_resv and unmaps the attachment. This keeps fence
@@ -13,7 +13,7 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  1 file changed, 2 insertions(+), 12 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index 1c71d64057b7..19ee83328487 100644
+index 432cf97cf2ab..9b83af8b88e3 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
 @@ -74,13 +74,6 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
@@ -51,3 +51,6 @@ index 1c71d64057b7..19ee83328487 100644
  	percpu_ref_kill(&map->active);
  }
  
+-- 
+2.43.0
+
