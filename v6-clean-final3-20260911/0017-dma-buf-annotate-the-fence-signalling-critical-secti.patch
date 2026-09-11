@@ -1,4 +1,4 @@
-From 01491998a44917bab03f2e54c0d953a05c53382f Mon Sep 17 00:00:00 2001
+From 790971ab7bbf8d2f053cea178db1ebd83fda29d1 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:55:05 +0530
 Subject: [PATCH 17/17] dma-buf: annotate the fence signalling critical section
@@ -38,10 +38,10 @@ first added the dedicated unmap workqueue.
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index c83769e5ed00..fcb81afddfe5 100644
+index ca248cd1c5f5..63da330add1c 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
-@@ -93,15 +93,37 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+@@ -89,15 +89,37 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
  static void dma_buf_io_map_active_release(struct percpu_ref *ref)
  {
  	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
