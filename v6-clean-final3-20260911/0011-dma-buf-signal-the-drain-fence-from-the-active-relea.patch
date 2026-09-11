@@ -1,0 +1,53 @@
+From 8513e18f3a1af5872bbe7aa9f86dcf8dc99e9d91 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 15:39:09 +0530
+Subject: [PATCH 11/17] dma-buf: signal the drain fence from the active release
+
+Signal the fence as soon as the last active user is gone, before queuing
+the worker that locks dma_resv and unmaps the attachment. This keeps fence
+signalling independent of deferred worker execution.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index 432cf97cf2ab..9b83af8b88e3 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -74,13 +74,6 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ 	struct dma_buf_io_ctx *ctx = map->ctx;
+ 	struct dma_buf *dmabuf = ctx->dmabuf;
+ 
+-	/*
+-	 * There are no more requests using the map, we can signal the fence.
+-	 * It should be done before taking the resv lock as someone could be
+-	 * waiting for the fence while holding the lock.
+-	 */
+-	dma_fence_signal(fence);
+-
+ 	dma_resv_lock(dmabuf->resv, NULL);
+ 	ctx->dev_ops->unmap(ctx, map);
+ 	dma_resv_unlock(dmabuf->resv);
+@@ -94,7 +87,7 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ {
+ 	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
+ 
+-	/* might sleep, use a worker */
++	dma_fence_signal(map->fence);
+ 	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
+ 	queue_work(system_wq, &map->release_work);
+ }
+@@ -207,10 +200,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 	}
+ 
+ 	dma_resv_add_fence(dmabuf->resv, map->fence, DMA_RESV_USAGE_KERNEL);
+-	/*
+-	 * Delay destruction until all inflight requests using the map are
+-	 * gone. It'll also signal the fence then.
+-	 */
++	/* Delay unmap until all active users are gone. */
+ 	percpu_ref_kill(&map->active);
+ }
+ 
+-- 
+2.43.0
+
