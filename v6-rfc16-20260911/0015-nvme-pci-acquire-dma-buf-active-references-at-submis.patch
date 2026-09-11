@@ -1,4 +1,4 @@
-From 8eada40e07e4a11bbd0829f2253ecea0e96fdb38 Mon Sep 17 00:00:00 2001
+From 0a36ae3700da4eff3b14f59043b984a604922694 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:48:47 +0530
 Subject: [PATCH 15/16] nvme-pci: acquire dma-buf active references at
@@ -34,7 +34,7 @@ index 86ad8f848f96..a52386cdc964 100644
  out:
  	dma_resv_unlock(dmabuf->resv);
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
-index 868524ca3575..82a69fac6a80 100644
+index 868524ca3575..5675fd28fbac 100644
 --- a/drivers/nvme/host/pci.c
 +++ b/drivers/nvme/host/pci.c
 @@ -427,6 +427,12 @@ enum nvme_iod_flags {
@@ -218,17 +218,7 @@ index 868524ca3575..82a69fac6a80 100644
  	if (use_sgl == SGL_UNSUPPORTED)
  		return nvme_rq_setup_dmabuf_map(req, nvmeq);
  
-@@ -1695,6 +1751,9 @@ static blk_status_t nvme_prep_rq(struct request *req)
- 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
- 	blk_status_t ret;
- 
-+	/* Requeued requests must have released map->active. */
-+	WARN_ON_ONCE(iod->flags & IOD_DMABUF_ACTIVE);
-+
- 	iod->flags = 0;
- 	iod->nr_descriptors = 0;
- 	iod->total_len = 0;
-@@ -1773,18 +1832,19 @@ static void nvme_submit_cmds(struct nvme_queue *nvmeq, struct rq_list *rqlist)
+@@ -1773,18 +1829,19 @@ static void nvme_submit_cmds(struct nvme_queue *nvmeq, struct rq_list *rqlist)
  	spin_unlock(&nvmeq->sq_lock);
  }
  
@@ -252,7 +242,7 @@ index 868524ca3575..82a69fac6a80 100644
  }
  
  static void nvme_queue_rqs(struct rq_list *rqlist)
-@@ -1795,14 +1855,26 @@ static void nvme_queue_rqs(struct rq_list *rqlist)
+@@ -1795,14 +1852,26 @@ static void nvme_queue_rqs(struct rq_list *rqlist)
  	struct request *req;
  
  	while ((req = rq_list_pop(rqlist))) {
