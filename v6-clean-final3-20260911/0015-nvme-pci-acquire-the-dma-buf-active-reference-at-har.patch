@@ -1,10 +1,10 @@
-From bcf898e6e67ebe26e16bd5d859b85d3e9b678c2e Mon Sep 17 00:00:00 2001
+From 2616eea2e6bf788c563b5054d6b04193aa5afac1 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:48:47 +0530
 Subject: [PATCH 15/17] nvme-pci: acquire the dma-buf active reference at
  hardware submission
 
-Acquire the dma-buf active reference at hardware submission, where the NVMe DMA mapping is first accessed.
+Acquire the dma-buf active reference at NVMe hardware submission.
 
 Release it on completion or setup failure, and preserve terminal generation-loss status in batched requests.
 
