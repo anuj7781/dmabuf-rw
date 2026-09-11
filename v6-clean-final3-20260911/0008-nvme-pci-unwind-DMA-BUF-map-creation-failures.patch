@@ -1,10 +1,11 @@
-From 7aec16a08fff02d0ba5d048700057e18a0253229 Mon Sep 17 00:00:00 2001
+From 5502e78041fcece210746f3bf7cfc43658faf456 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:33:09 +0530
 Subject: [PATCH 08/17] nvme-pci: unwind DMA-BUF map creation failures
 
-Release the attachment mapping and map allocation when the DMA segment
-size is invalid.
+NVMe cannot use a DMA-BUF mapping with invalid segment
+granularity. Unmap the attachment and free the driver map before
+returning the error.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 

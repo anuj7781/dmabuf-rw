@@ -1,9 +1,10 @@
-From 188c3804d461ac62054353db1f2f276f929f3600 Mon Sep 17 00:00:00 2001
+From a536ffbb185c401cf5c1aba8d2963ddc8b8ffb19 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 14:48:29 +0530
 Subject: [PATCH 01/17] dma-buf: document dma_buf_io_map::seg_shift
 
-Document the segment-length granularity used to split opaque dma-buf bios.
+Document the segment-size granularity used by the block layer to
+split DMA-BUF backed I/O without inspecting the importer's mapping.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 

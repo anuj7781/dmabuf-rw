@@ -1,12 +1,12 @@
-From 83e5e8c0679a9dc5b16b972799b60fbf87b99c7f Mon Sep 17 00:00:00 2001
+From ef96e34e322d1ef9f35d36aa63975cf06ac7d618 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:40:08 +0530
 Subject: [PATCH 13/17] dma-buf: run deferred unmap on a WQ_MEM_RECLAIM
  workqueue
 
-Run deferred DMA-BUF unmap on a dedicated WQ_MEM_RECLAIM workqueue.
-
-Keep reclaim-triggered teardown off a saturated system workqueue.
+An exporter reclaiming the buffer can wait for the importer to unmap
+it. Run deferred unmap on a dedicated WQ_MEM_RECLAIM workqueue so
+system workqueue saturation cannot stall teardown.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 

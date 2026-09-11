@@ -1,12 +1,15 @@
-From c4b3bc3eba7069d072e61c6705ad67465c1e39e1 Mon Sep 17 00:00:00 2001
+From d0430cf71bf506af479512c328076616ca31108e Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:41:20 +0530
 Subject: [PATCH 14/17] io_uring/rsrc: re-import when the cached dma-buf map is
  stale
 
-Validate a cached dma-buf map before reusing it.
+A request can retain a software reference to a map after the exporter
+invalidates that generation. Before reusing the cached map, compare
+it with the context's current map.
 
-Drop stale generations and re-import the current map.
+Drop a stale reference and perform the normal import again so the
+request uses the current generation.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 

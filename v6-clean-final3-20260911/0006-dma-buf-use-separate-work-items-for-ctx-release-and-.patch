@@ -1,11 +1,12 @@
-From 0f689ed7e10173a428735c8576a93179e526f766 Mon Sep 17 00:00:00 2001
+From e6008ad7291649a8d94d100d1316bcabd6e47459 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:18:18 +0530
 Subject: [PATCH 06/17] dma-buf: use separate work items for ctx release and
  destroy
 
-The map release path can reinitialize the ctx release work item while it
-is running. Use separate work items for release and destruction.
+Context release can schedule final destruction before the release
+worker has returned. Use separate work items so a running work_struct
+is never reinitialized for a different callback.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 

@@ -1,16 +1,15 @@
-From 8670a1ad6c340dad742971bcd671178496683f72 Mon Sep 17 00:00:00 2001
+From da8bdd5c5eb1a160b1a48c7c6453176cb876fb49 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Fri, 11 Sep 2026 16:04:56 +0530
 Subject: [PATCH 12/17] dma-buf: initialise the drain fence after reserving its
  slot
 
-A fence must be initialized only after reclaim-capable preparation is
-complete and dma_resv_reserve_fences() has reserved its slot. Allocate the
-fence storage with the map, but initialize it immediately before publishing
-it during invalidation.
+Fence initialization must follow all reclaim-capable
+preparation. Reserve the DMA reservation slot first, then initialize
+and publish the drain fence.
 
-If reserving the slot fails, no fence can be published. Drain active users
-with a completion and unmap synchronously instead.
+If the reservation fails, no fence can be published. Drain active
+users synchronously and unmap the attachment instead.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 

@@ -1,12 +1,11 @@
-From c173465c650665bbcd1788af894816b6a01d0eff Mon Sep 17 00:00:00 2001
+From 52f9e028024dfb44238716bfdd4b58197d4241ab Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Fri, 11 Sep 2026 14:14:36 +0530
 Subject: [PATCH 09/17] dma-buf: pin I/O contexts while releasing their maps
 
-The map release worker checks ctx->refs before incrementing it, but the
-check and increment are not atomic. Take the reference when the map is
-initialized, while the context is known to be live, and release it after
-unmap completes. Drop the same reference when map creation is unwound.
+The release worker previously checked the context refcount before
+incrementing it, leaving a check-then-increment race. Pin the context
+when the map is initialized and drop the pin after the map is released.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 

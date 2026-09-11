@@ -1,14 +1,17 @@
-From db897b973783df1f5408d8034cee8140ad83a3f2 Mon Sep 17 00:00:00 2001
+From b73b7092fa36bb703033ff01c51af57c5916de5d Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:48:47 +0530
 Subject: [PATCH 15/17] nvme-pci: acquire the dma-buf active reference at
  hardware submission
 
-Acquire the dma-buf active reference at NVMe hardware submission.
+Holding the active reference throughout I/O preparation allows
+reclaim-capable allocations to delay fence signalling. Acquire it in
+the NVMe submission path immediately before the driver first accesses
+the DMA mapping.
 
-Release it on completion or setup failure.
-
-Preserve terminal generation-loss status in batched requests.
+Release the reference on completion and every setup failure. Treat
+generation loss as terminal and preserve that status in batched
+submissions instead of requeueing the request against the same map.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 

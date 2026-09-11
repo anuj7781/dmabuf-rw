@@ -1,22 +1,15 @@
-From dc6ad177f60a5cd853d1461ea508df01ab25fe8a Mon Sep 17 00:00:00 2001
+From 2d2f7c2181a590cf8ae1939b6fe37d801ca52e3c Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Fri, 11 Sep 2026 14:18:22 +0530
 Subject: [PATCH 10/17] dma-buf: split map pointer and DMA-active lifetimes
 
-The map reference currently covers both software pointer holders and
-device access to the DMA mapping. Importers can hold it across
-reclaim-capable I/O preparation, while invalidation publishes a fence
-whose signalling depends on that reference draining.
+Software users can retain a map pointer while I/O preparation sleeps
+or allocates memory, but invalidation only needs to wait for users
+that can access the DMA mapping.
 
-Use a kref for the map object and retain the percpu_ref for DMA-active
-users. Reclaim the map through RCU so a lookup racing removal can safely
-acquire the kref. Keep the context pinned until final map release, making
-map->ctx valid for the complete software lifetime.
-
-This may defer context teardown while stale software references remain.
-The current io_uring consumer already pins the context resource for the
-same request lifetime. A later change moves active-reference acquisition
-to NVMe hardware submission.
+Use a kref to protect the map and its context, and retain the
+percpu_ref as the gate for active DMA access. Free the map through
+RCU after all software references are gone.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 

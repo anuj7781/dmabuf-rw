@@ -1,10 +1,11 @@
-From 72d32d79a26f67792c8a6857fef424444c459c76 Mon Sep 17 00:00:00 2001
+From 71506cb8cf3f5e069271b3a0dda7ad5ddb98dae2 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 14:54:52 +0530
 Subject: [PATCH 05/17] dma-buf: unwind incomplete DMA-BUF I/O contexts
 
-Release driver state and drop the dma-buf reference before failing an
-incomplete ops table.
+An importer can initialize private state before the common code
+validates its operations table. Release that state and the DMA-BUF
+reference when validation fails.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 

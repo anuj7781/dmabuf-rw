@@ -1,11 +1,11 @@
-From 8513e18f3a1af5872bbe7aa9f86dcf8dc99e9d91 Mon Sep 17 00:00:00 2001
+From c41e1e624c23ea373cb43ff6f0f666195d4a75f7 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:39:09 +0530
 Subject: [PATCH 11/17] dma-buf: signal the drain fence from the active release
 
-Signal the fence as soon as the last active user is gone, before queuing
-the worker that locks dma_resv and unmaps the attachment. This keeps fence
-signalling independent of deferred worker execution.
+The drain fence only needs to wait for active DMA users. Signal it
+directly when the last active reference is released, before deferred
+unmap work is queued.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 

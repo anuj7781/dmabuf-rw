@@ -1,9 +1,10 @@
-From 2aac3c5c72bef6543fb9b70e541b560b65360f5b Mon Sep 17 00:00:00 2001
+From 0fcde0d81a8d3e958b65fe0702fb251dfe5ebb72 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 14:51:08 +0530
 Subject: [PATCH 02/17] dma-buf: drop the dma_buf_io_fence wrapper struct
 
-Use dma_fence's inline lock instead of a wrapper.
+The drain fence does not need a private wrapper or lock. Store struct
+dma_fence directly in the map and use the lock embedded in the fence.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 

@@ -1,10 +1,11 @@
-From c75935326e9023c54668802c54a6f0775c2f22e3 Mon Sep 17 00:00:00 2001
+From 88f69b6b88adb687c174b3cb0b5c56bf79456d44 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 14:52:49 +0530
 Subject: [PATCH 04/17] dma-buf: wait for fences under the reservation lock
 
-Keep the reservation lock held from the fence wait through map creation,
-so a new fence cannot be installed between them.
+Map creation must observe a stable set of DMA-BUF fences. Take the
+reservation lock before waiting and keep it held until the new mapping
+has been created.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 

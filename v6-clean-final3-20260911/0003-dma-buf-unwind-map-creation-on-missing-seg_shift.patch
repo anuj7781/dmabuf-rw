@@ -1,10 +1,11 @@
-From 8cc2bdcdc40febfeee1631c935006c64750470a5 Mon Sep 17 00:00:00 2001
+From bebd5d5513c9047a74d71f634495bef80d3d909f Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 14:52:12 +0530
 Subject: [PATCH 03/17] dma-buf: unwind map creation on missing seg_shift
 
-Release map resources and the reservation lock when ->map() returns
-without setting seg_shift.
+A map returned without segment granularity cannot be used by the
+block layer. Unmap it and release the initialized map resources before
+returning an error.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 

@@ -1,4 +1,4 @@
-From 69b195b6af20d4599a7ca19e939220b4925fd71c Mon Sep 17 00:00:00 2001
+From 53297e6d667061edbe9f79d8536bfde2a8a120a9 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:55:05 +0530
 Subject: [PATCH 17/17] dma-buf: annotate the fence signalling critical section
