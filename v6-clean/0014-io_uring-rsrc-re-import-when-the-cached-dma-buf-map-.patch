@@ -1,4 +1,4 @@
-From 5c34f0cae860bcfa2876539d8ab6b244d4445fae Mon Sep 17 00:00:00 2001
+From 70502344f15fe595fa83d213f76dec8085848da3 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:41:20 +0530
 Subject: [PATCH 14/18] io_uring/rsrc: re-import when the cached dma-buf map is
@@ -101,6 +101,3 @@ index 5074b1e4b050..f27eb3d0ebcc 100644
  	}
  
  	map = dma_buf_io_get_map(&db->ctx);
--- 
-2.43.0
-

@@ -23,7 +23,7 @@ head (`71c75106fd3c`) rather than on old commit 1:
 | 7 | `dma-buf: keep target file alive through ctx teardown` | 3 (the `fput()`-before-teardown half) |
 | 8 | `nvme-pci: unwind DMA-BUF map creation failures` | new -- v5 bug found while rewriting commit 2's territory: nvme's `->map()` had the same missing-unwind shape as commit 3 above |
 | 9 | `dma-buf: pin I/O contexts while releasing their maps` | 1 (the ctx-pin-timing half only: unconditional `refcount_inc()` in `dma_buf_io_init_map()`, replacing the check-then-increment TOCTOU Christian flagged on v4 -- still v5's original single `percpu_ref`, no kref/active split yet) |
-| 10 | `dma-buf: split map pointer and DMA-active lifetimes` | 1 (the kref/active split, RCU free, `free_map()`) -- **redesigned**; see below |
+| 10 | `dma-buf: split map pointer and DMA-active lifetimes` | 1 (the kref/active split and RCU-delayed free) -- **redesigned**; see below |
 | 11 | `dma-buf: do not leak ctx on ctx_release_work's WARN_ON_ONCE paths` | 3 (the teardown-WARN leak half) -- placed after commit 10; see "Ordering fix" below |
 | 12 | `dma-buf: initialise the drain fence after reserving its slot` | 1 (the fence-ordering half: `dma_fence_init()` moved past `dma_resv_reserve_fences()`, `release_mode`, the sync-drain fallback, and the signal moved out of the worker) |
 | 13 | `dma-buf: run deferred unmap on a WQ_MEM_RECLAIM workqueue` | 1 (the dedicated workqueue half, landed *after* 12 -- the original commit's title claimed this made signalling safe, which was never true; that is commit 12's doing) |
@@ -59,7 +59,7 @@ unmap. This removes `map->dev_ops` entirely -- the RCU callback reads
 the RCU callback itself, not until unmap) keeps it valid by construction.
 
 Verified before implementing:
-- No final-release path can call `free_map()` before `unmap()` has run:
+- No final-release path can free the map before `unmap()` has run:
   the publication kref is still dropped only by the unmap worker (or the
   SYNC fallback), after unmap, unchanged from before.
 - The synchronous reserve-failure fallback drops exactly one publication
@@ -89,6 +89,20 @@ review's recommendation: the ctx-pin-timing fix (9) is independently
 motivated by Christian König's v4 comment and doesn't need the kref/active
 split to justify itself -- same granularity principle used elsewhere in
 this series.
+
+**Further streamlined after landing:** `dev_ops->free_map()` was removed
+entirely, not just the `map->dev_ops` cache. `dma_buf_io_map_free_rcu()`
+now does a plain `kfree(map)`. This is sound because every current
+consumer (nvme-pci) embeds `struct dma_buf_io_map` as the first member of
+its own container struct, so `kfree()` on the base pointer already frees
+the whole allocation -- `kmalloc_flex()`/`kfree()` operate on the pointer's
+slab metadata, not a driver-declared size. A per-driver `free_map()` hook
+would only earn its keep if some future importer's container needed
+device-specific cleanup beyond freeing memory (nvme's own `free_map()` was
+already just `kfree()`), so it was dropped as unneeded abstraction rather
+than kept "for robustness". `nvme_dma_buf_io_ops` no longer has a
+`.free_map` entry, and `dma_buf_io_ctx_create()`'s ops-completeness check
+no longer requires one.
 
 ## Ordering fix: commit 11 was originally placed before commit 10
 

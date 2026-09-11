@@ -1,4 +1,4 @@
-From 7e796fcd2e4a6c10a94575762f1fcc6c5f9c82ae Mon Sep 17 00:00:00 2001
+From 1d78e3f43451ef05382376243aa1945b942638de Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:48:47 +0530
 Subject: [PATCH 15/18] nvme-pci: acquire the dma-buf active reference at
@@ -82,30 +82,25 @@ loop on the nvme_queue_rqs() batch path.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 ---
- drivers/dma-buf/dma-buf-io.c |   4 +-
+ drivers/dma-buf/dma-buf-io.c |   1 -
  drivers/nvme/host/pci.c      | 168 +++++++++++++++++++++++++++++++++--
- include/linux/dma-buf-io.h   |  24 ++++-
- 3 files changed, 182 insertions(+), 14 deletions(-)
+ include/linux/dma-buf-io.h   |   5 +-
+ 3 files changed, 162 insertions(+), 12 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index f16a2a3eb350..24b2a6428ae2 100644
+index a7c789654054..f77203b101ac 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
-@@ -235,10 +235,10 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
- 	 * map->refs was kref_init()'d to 1 by dma_buf_io_init_map(), owned by
- 	 * ctx (dropped once the last software reference to this generation
- 	 * is released). This get is the calling request's own reference,
--	 * matching the cache-hit path above.
-+	 * matching the cache-hit path above. ->active is not touched here --
-+	 * see the ->active comment in dma-buf-io.h.
- 	 */
+@@ -215,7 +215,6 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 
+ 	/* Return a caller reference in addition to the publication reference. */
  	kref_get(&map->refs);
 -	percpu_ref_get(&map->active);
  	rcu_assign_pointer(ctx->map, map);
  out:
  	dma_resv_unlock(dmabuf->resv);
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
-index 36fa51fa5874..99604d37f864 100644
+index 868524ca3575..cf7218940480 100644
 --- a/drivers/nvme/host/pci.c
 +++ b/drivers/nvme/host/pci.c
 @@ -427,6 +427,19 @@ enum nvme_iod_flags {
@@ -401,47 +396,25 @@ index 36fa51fa5874..99604d37f864 100644
  	iod->nr_descriptors = 0;
  	iod->total_len = 0;
 diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
-index 78d3ac64315d..1089263f85dc 100644
+index f9c2241ce60c..1195f279fd60 100644
 --- a/include/linux/dma-buf-io.h
 +++ b/include/linux/dma-buf-io.h
-@@ -63,9 +63,20 @@ struct dma_buf_io_map {
+@@ -51,8 +51,8 @@ struct dma_buf_io_map {
  	struct kref			refs;
  
  	/*
--	 * Active reference: gates the DMA mapping. Killed on invalidation;
--	 * dev_ops->unmap() only runs once every reference taken before the
--	 * kill has been returned.
-+	 * Active reference: gates the DMA mapping. Held only from a
-+	 * successful driver-level tryget at hardware submission (e.g.
-+	 * nvme_rq_setup_dmabuf() -> nvme_dmabuf_tryget_active()) through the
-+	 * matching put at completion or cancellation. This is the only
-+	 * reference the drain fence depends on: it is bounded by hardware,
-+	 * never by reclaim or task scheduling. dev_ops->unmap() only runs
-+	 * once every reference taken before dma_buf_io_drop_map()'s kill has
-+	 * been returned.
-+	 *
-+	 * Deliberately decoupled from ->refs: a request holds ->refs for its
-+	 * whole lifetime (including reclaim-capable allocation and
-+	 * scheduling), but must not touch ->active -- and therefore must not
-+	 * dereference driver DMA state -- until a driver's submission funnel
-+	 * has successfully acquired it. See dma_buf_io_map_active_tryget().
+-	 * Gates DMA-map access. Killed on invalidation and drained before
+-	 * ->unmap().
++	 * Gates DMA-map access from hardware submission through completion.
++	 * Killed on invalidation and drained before ->unmap().
  	 */
  	struct percpu_ref		active;
  
-@@ -124,6 +135,13 @@ static inline void dma_buf_io_map_active_put(struct dma_buf_io_map *map)
+@@ -110,6 +110,7 @@ static inline void dma_buf_io_map_active_put(struct dma_buf_io_map *map)
  	percpu_ref_put(&map->active);
  }
  
-+/*
-+ * dma_buf_io_get_map() / dma_buf_io_map_drop() manage the *software*
-+ * reference only: safe to hold across allocation, reclaim and scheduling.
-+ * They do not imply the DMA mapping is valid and do not touch ->active --
-+ * a driver's hardware-submission funnel acquires that separately, via
-+ * dma_buf_io_map_active_tryget().
-+ */
++/* This acquires only a software reference; active is driver-managed. */
  static inline struct dma_buf_io_map *
  dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
  {
--- 
-2.43.0
-

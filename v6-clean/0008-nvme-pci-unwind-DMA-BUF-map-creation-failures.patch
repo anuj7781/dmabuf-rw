@@ -28,6 +28,3 @@ index 67e26d6e8f25..868524ca3575 100644
  
  	ret = dma_buf_io_init_map(ctx, &map->base);
  	if (ret)
--- 
-2.43.0
-

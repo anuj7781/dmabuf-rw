@@ -32,6 +32,3 @@ index 6834a79700ce..fbf91db5617e 100644
  
  	percpu_ref_get(&map->refs);
  	rcu_assign_pointer(ctx->map, map);
--- 
-2.43.0
-

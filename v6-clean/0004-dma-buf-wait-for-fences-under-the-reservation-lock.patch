@@ -58,6 +58,3 @@ index fbf91db5617e..0821f740681a 100644
  
  	map = ctx->dev_ops->map(ctx);
  	if (IS_ERR(map)) {
--- 
-2.43.0
-

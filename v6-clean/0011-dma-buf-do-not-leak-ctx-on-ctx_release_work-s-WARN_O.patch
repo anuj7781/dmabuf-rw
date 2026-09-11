@@ -1,4 +1,4 @@
-From 29f60ef1052682de780bd7739f0ce1cc18aa9f7c Mon Sep 17 00:00:00 2001
+From 28208dcbd77cb4ca42b42abf0a8e20956d88967d Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:20:53 +0530
 Subject: [PATCH 11/18] dma-buf: do not leak ctx on ctx_release_work's
@@ -54,10 +54,10 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  1 file changed, 8 insertions(+), 4 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index 9cf1ac2f78e9..acef9d475768 100644
+index 432cf97cf2ab..1c71d64057b7 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
-@@ -259,10 +259,14 @@ static void dma_buf_io_ctx_release_work(struct work_struct *work)
+@@ -236,10 +236,14 @@ static void dma_buf_io_ctx_release_work(struct work_struct *work)
  	ret = dma_resv_wait_timeout(dmabuf->resv, DMA_RESV_USAGE_KERNEL,
  				    false, MAX_SCHEDULE_TIMEOUT);
  
@@ -76,6 +76,3 @@ index 9cf1ac2f78e9..acef9d475768 100644
  
  	dma_buf_io_ctx_put(ctx);
  }
--- 
-2.43.0
-

@@ -76,6 +76,3 @@ index 23f282d31f36..867709f84fc5 100644
  	void					*dev_priv;
  	const struct dma_buf_io_ops		*dev_ops;
  };
--- 
-2.43.0
-

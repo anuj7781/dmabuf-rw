@@ -1,4 +1,4 @@
-From 9c2679c8f8b53c16a0d765711b3480fd8fe3b0ff Mon Sep 17 00:00:00 2001
+From f5e1d26bf0a980c2d76db65bfddae9a1bb87554f Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:54:10 +0530
 Subject: [PATCH 17/18] dma-buf: defer percpu_ref_exit() to the map's final
@@ -43,35 +43,22 @@ describes.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 ---
- drivers/dma-buf/dma-buf-io.c | 26 ++++++++++++++++++++++++--
- 1 file changed, 24 insertions(+), 2 deletions(-)
+ drivers/dma-buf/dma-buf-io.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index 24b2a6428ae2..ec348ac54ce3 100644
+index f77203b101ac..f0164314e5b0 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
-@@ -73,6 +73,20 @@ static void dma_buf_io_map_free_rcu(struct rcu_head *rcu)
+@@ -68,6 +68,7 @@ static void dma_buf_io_map_free_rcu(struct rcu_head *rcu)
  	struct dma_buf_io_map *map = container_of(rcu, struct dma_buf_io_map, rcu);
  	struct dma_buf_io_ctx *ctx = map->ctx;
  
-+	/*
-+	 * percpu_ref_exit()'s contract is that the ref is "no longer in
-+	 * active use". Only here is that actually true: a software kref
-+	 * holder is allowed to sit in the block layer across an entire
-+	 * invalidation and then attempt dma_buf_io_map_active_tryget()
-+	 * against its cached map pointer, so exiting the ref any earlier --
-+	 * while krefs remain -- would risk a tryget racing a torn-down
-+	 * percpu_ref. It happens to be harmless today only because
-+	 * __percpu_ref_exit() leaves __PERCPU_REF_DEAD set in
-+	 * percpu_count_ptr, which tryget_live() checks before it would
-+	 * dereference the (also cleared) ->data pointer -- an implementation
-+	 * detail, not a guarantee.
-+	 */
 +	percpu_ref_exit(&map->active);
- 	ctx->dev_ops->free_map(map);
+ 	kfree(map);
  	dma_buf_io_ctx_put(ctx);
  }
-@@ -103,7 +117,10 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+@@ -98,7 +99,10 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
  	dma_resv_unlock(dmabuf->resv);
  
  	dma_fence_put(fence);
@@ -83,7 +70,7 @@ index 24b2a6428ae2..ec348ac54ce3 100644
  	kref_put(&map->refs, __dma_buf_io_map_free);
  }
  
-@@ -277,7 +294,12 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+@@ -253,7 +257,12 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
  		/* Never dma_fence_init()'d on this path; plain kfree. */
  		kfree(map->fence);
  		map->fence = NULL;
@@ -97,6 +84,3 @@ index 24b2a6428ae2..ec348ac54ce3 100644
  		kref_put(&map->refs, __dma_buf_io_map_free);
  		return;
  	}
--- 
-2.43.0
-

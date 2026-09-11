@@ -1,4 +1,4 @@
-From 9e442a23fac7a224823b136a5e8067f63924bb32 Mon Sep 17 00:00:00 2001
+From da7e2dfb7e38a6a9749af871ee09f7e40b28ef80 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:49:32 +0530
 Subject: [PATCH 16/18] nvme-pci: end terminal dma-buf failures instead of
@@ -40,7 +40,7 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  1 file changed, 38 insertions(+), 6 deletions(-)
 
 diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
-index 99604d37f864..ca1691447beb 100644
+index cf7218940480..b6e9f0ff1a99 100644
 --- a/drivers/nvme/host/pci.c
 +++ b/drivers/nvme/host/pci.c
 @@ -1923,18 +1923,27 @@ static void nvme_submit_cmds(struct nvme_queue *nvmeq, struct rq_list *rqlist)
@@ -115,6 +115,3 @@ index 99604d37f864..ca1691447beb 100644
  	}
  
  	if (nvmeq)
--- 
-2.43.0
-

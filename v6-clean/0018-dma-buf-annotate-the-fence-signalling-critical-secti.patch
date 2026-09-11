@@ -1,4 +1,4 @@
-From 9f9a87fa18dd9f25f748cf02479e9e80fad1c077 Mon Sep 17 00:00:00 2001
+From 0b33a06127af211120e8a5025d32450f481b44b6 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:55:05 +0530
 Subject: [PATCH 18/18] dma-buf: annotate the fence signalling critical section
@@ -41,10 +41,10 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  1 file changed, 25 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index ec348ac54ce3..c373b5966631 100644
+index f0164314e5b0..0cb3a62955c3 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
-@@ -132,6 +132,27 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+@@ -114,6 +114,27 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
  static void dma_buf_io_map_active_release(struct percpu_ref *ref)
  {
  	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
@@ -72,7 +72,7 @@ index ec348ac54ce3..c373b5966631 100644
  
  	switch (map->release_mode) {
  	case DMA_BUF_IO_RELEASE_SYNC:
-@@ -141,7 +162,7 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+@@ -123,7 +144,7 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
  		 * published for this generation.
  		 */
  		complete(&map->drain);
@@ -81,7 +81,7 @@ index ec348ac54ce3..c373b5966631 100644
  	case DMA_BUF_IO_RELEASE_FENCED:
  	default:
  		/*
-@@ -153,7 +174,10 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+@@ -135,7 +156,10 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
  		dma_fence_signal(map->fence);
  		INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
  		queue_work(dma_buf_io_wq, &map->release_work);
@@ -92,6 +92,3 @@ index ec348ac54ce3..c373b5966631 100644
  }
  
  int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
--- 
-2.43.0
-
