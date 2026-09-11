@@ -1,0 +1,86 @@
+From 4005017e83a7bcdc37f9007f0032ebd8f281dc82 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 15:54:10 +0530
+Subject: [PATCH 16/17] dma-buf: defer percpu_ref_exit() to the map's final
+ release
+
+percpu_ref_exit()'s documented contract is that the caller ensures the
+ref is "no longer in active use". The unmap worker and the
+reserve-failure synchronous fallback in dma_buf_io_drop_map() both called
+it immediately after unmap, while still holding ctx->map's publication
+kref -- but a request only ever needs a kref, not an active reference,
+to sit in the block layer. It can hold that kref across an entire
+invalidation and then, on reaching a driver's hardware-submission funnel
+(e.g. nvme_dmabuf_tryget_active()), attempt a fresh active_tryget against
+its cached map pointer -- on a percpu_ref that has already been
+percpu_ref_exit()'d.
+
+This is reachable, not exotic: it is the ordinary "request was queued
+behind something slow while a migration happened" case, and it now
+applies to both call sites -- the FENCED worker and the SYNC fallback --
+since the previous commit made nvme's submission funnel, not import, the
+thing that acquires ->active.
+
+It has been benign so far only by implementation accident.
+__percpu_ref_exit() sets ref->percpu_count_ptr = __PERCPU_REF_ATOMIC_DEAD
+and frees the percpu allocation; percpu_ref_tryget_live_rcu() tests
+!(percpu_count_ptr & __PERCPU_REF_DEAD) before it would dereference
+ref->data, which exit() has also set to NULL. So the tryget returns false
+instead of a NULL-dereference or a use-after-free -- but nothing in
+percpu_ref's documented contract promises that ordering; it is not
+something to build correctness on.
+
+Move percpu_ref_exit() out of both call sites and into
+dma_buf_io_map_free_rcu(), the kref's RCU-delayed free callback. By
+construction no kref holder remains once that callback runs, so the "no
+longer in active use" contract actually holds there.
+
+The seg_shift driver-bug unwind path in dma_buf_io_create_map() is
+unaffected: that map was never published to ctx->map, so no kref holder
+other than the caller about to unwind it can exist, and percpu_ref_exit()
+right there is the ordinary init-failure use the function's own kdoc
+describes.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index aaf1974aa459..4b32ca7997b8 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -68,6 +68,7 @@ static void dma_buf_io_map_free_rcu(struct rcu_head *rcu)
+ 	struct dma_buf_io_map *map = container_of(rcu, struct dma_buf_io_map, rcu);
+ 	struct dma_buf_io_ctx *ctx = map->ctx;
+ 
++	percpu_ref_exit(&map->active);
+ 	kfree(map);
+ 	dma_buf_io_ctx_put(ctx);
+ }
+@@ -93,7 +94,10 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ 	dma_resv_unlock(dmabuf->resv);
+ 
+ 	dma_fence_put(fence);
+-	percpu_ref_exit(&map->active);
++	/*
++	 * percpu_ref_exit() deliberately does not happen here; see
++	 * dma_buf_io_map_free_rcu().
++	 */
+ 	kref_put(&map->refs, __dma_buf_io_map_free);
+ }
+ 
+@@ -216,7 +220,12 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 		ctx->dev_ops->unmap(ctx, map);
+ 		kfree(map->fence);
+ 		map->fence = NULL;
+-		percpu_ref_exit(&map->active);
++		/*
++		 * percpu_ref_exit() deliberately does not happen here; see
++		 * dma_buf_io_map_free_rcu(). A request holding only a kref
++		 * can still attempt a fresh active_tryget against this exact
++		 * map after wait_for_completion() above returns.
++		 */
+ 		kref_put(&map->refs, __dma_buf_io_map_free);
+ 		return;
+ 	}
+-- 
+2.43.0
+
