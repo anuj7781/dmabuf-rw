@@ -1,0 +1,123 @@
+From 3ce8aa2dba96d2a41bd830335049688bc9835b09 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Fri, 11 Sep 2026 16:04:56 +0530
+Subject: [PATCH 13/19] dma-buf: initialise the drain fence after reserving its
+ slot
+
+A fence must be initialized only after reclaim-capable preparation is
+complete and dma_resv_reserve_fences() has reserved its slot. Allocate the
+fence storage with the map, but initialize it immediately before publishing
+it during invalidation.
+
+If reserving the slot fails, no fence can be published. Drain active users
+with a completion and unmap synchronously instead.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ drivers/dma-buf/dma-buf-io.c | 28 ++++++++++++++++++++--------
+ include/linux/dma-buf-io.h   |  9 +++++++++
+ 2 files changed, 29 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index 19ee83328487..b4c67ed82b9d 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -87,6 +87,11 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ {
+ 	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
+ 
++	if (map->release_mode == DMA_BUF_IO_RELEASE_SYNC) {
++		complete(&map->drain);
++		return;
++	}
++
+ 	dma_fence_signal(map->fence);
+ 	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
+ 	queue_work(system_wq, &map->release_work);
+@@ -108,11 +113,10 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+ 		return ret;
+ 	}
+ 
+-	dma_fence_init(fence, &dma_buf_io_fence_ops, NULL, ctx->fence_ctx,
+-		       atomic_inc_return(&ctx->fence_seq));
+ 	map->fence = fence;
+ 	map->ctx = ctx;
+ 	kref_init(&map->refs);
++	init_completion(&map->drain);
+ 
+ 	/* Keep ctx alive until the map's final release. */
+ 	refcount_inc(&ctx->refs);
+@@ -156,7 +160,8 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 
+ 	if (WARN_ON_ONCE(!map->seg_shift)) {
+ 		ctx->dev_ops->unmap(ctx, map);
+-		dma_fence_put(map->fence);
++		/* The fence has not been initialized. */
++		kfree(map->fence);
+ 		percpu_ref_exit(&map->active);
+ 		kref_put(&map->refs, __dma_buf_io_map_free);
+ 		ret = -EFAULT;
+@@ -190,16 +195,23 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 
+ 	ret = dma_resv_reserve_fences(dmabuf->resv, 1);
+ 	if (WARN_ON_ONCE(ret)) {
+-		struct dma_fence *fence = map->fence;
+-
+-		dma_fence_get(fence);
++		/* No fence can be published, so drain synchronously. */
++		map->release_mode = DMA_BUF_IO_RELEASE_SYNC;
+ 		percpu_ref_kill(&map->active);
+-		dma_fence_wait(fence, false);
+-		dma_fence_put(fence);
++		wait_for_completion(&map->drain);
++
++		ctx->dev_ops->unmap(ctx, map);
++		kfree(map->fence);
++		map->fence = NULL;
++		percpu_ref_exit(&map->active);
++		kref_put(&map->refs, __dma_buf_io_map_free);
+ 		return;
+ 	}
+ 
++	dma_fence_init(map->fence, &dma_buf_io_fence_ops, NULL, ctx->fence_ctx,
++		       atomic_inc_return(&ctx->fence_seq));
+ 	dma_resv_add_fence(dmabuf->resv, map->fence, DMA_RESV_USAGE_KERNEL);
++	map->release_mode = DMA_BUF_IO_RELEASE_FENCED;
+ 	/* Delay unmap until all active users are gone. */
+ 	percpu_ref_kill(&map->active);
+ }
+diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
+index 06686d8f266a..c0cc0b21e3f3 100644
+--- a/include/linux/dma-buf-io.h
++++ b/include/linux/dma-buf-io.h
+@@ -2,6 +2,7 @@
+ #ifndef __DMA_BUF_IO_H__
+ #define __DMA_BUF_IO_H__
+ 
++#include <linux/completion.h>
+ #include <linux/dma-buf.h>
+ #include <linux/kref.h>
+ #include <linux/rcupdate.h>
+@@ -9,6 +10,11 @@
+ struct dma_buf_io_ctx;
+ struct dma_buf_io_map;
+ 
++enum dma_buf_io_release_mode {
++	DMA_BUF_IO_RELEASE_FENCED,
++	DMA_BUF_IO_RELEASE_SYNC,
++};
++
+ struct dma_buf_io_ops {
+ 	/*
+ 	 * Create a new map for the given ctx. Called with the reservation
+@@ -45,7 +51,10 @@ struct dma_buf_io_map {
+ 	 */
+ 	unsigned			seg_shift;
+ 
++	enum dma_buf_io_release_mode	release_mode;
++
+ 	struct work_struct		release_work;
++	struct completion		drain;
+ 	struct dma_fence		*fence;
+ 	struct dma_buf_io_ctx		*ctx;
+ 	struct rcu_head			rcu;

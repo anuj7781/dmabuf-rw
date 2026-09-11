@@ -1,7 +1,7 @@
-From 0b33a06127af211120e8a5025d32450f481b44b6 Mon Sep 17 00:00:00 2001
+From c387648fc2a0909039f24b049766004c744ff767 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:55:05 +0530
-Subject: [PATCH 18/18] dma-buf: annotate the fence signalling critical section
+Subject: [PATCH 19/19] dma-buf: annotate the fence signalling critical section
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -37,14 +37,14 @@ first added the dedicated unmap workqueue.
 
 Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
 ---
- drivers/dma-buf/dma-buf-io.c | 26 +++++++++++++++++++++++++-
- 1 file changed, 25 insertions(+), 1 deletion(-)
+ drivers/dma-buf/dma-buf-io.c | 30 ++++++++++++++++++++++++++----
+ 1 file changed, 26 insertions(+), 4 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index f0164314e5b0..0cb3a62955c3 100644
+index b99fb6a00b4b..ac17099037ac 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
-@@ -114,6 +114,27 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+@@ -104,15 +104,37 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
  static void dma_buf_io_map_active_release(struct percpu_ref *ref)
  {
  	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
@@ -70,24 +70,18 @@ index f0164314e5b0..0cb3a62955c3 100644
 +	 */
 +	cookie = dma_fence_begin_signalling();
  
- 	switch (map->release_mode) {
- 	case DMA_BUF_IO_RELEASE_SYNC:
-@@ -123,7 +144,7 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
- 		 * published for this generation.
- 		 */
+ 	if (map->release_mode == DMA_BUF_IO_RELEASE_SYNC) {
  		complete(&map->drain);
 -		return;
-+		break;
- 	case DMA_BUF_IO_RELEASE_FENCED:
- 	default:
- 		/*
-@@ -135,7 +156,10 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
- 		dma_fence_signal(map->fence);
- 		INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
- 		queue_work(dma_buf_io_wq, &map->release_work);
-+		break;
++	} else {
++		dma_fence_signal(map->fence);
++		INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
++		queue_work(dma_buf_io_wq, &map->release_work);
  	}
-+
+ 
+-	dma_fence_signal(map->fence);
+-	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
+-	queue_work(dma_buf_io_wq, &map->release_work);
 +	dma_fence_end_signalling(cookie);
  }
  

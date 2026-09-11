@@ -1,7 +1,7 @@
-From 1d78e3f43451ef05382376243aa1945b942638de Mon Sep 17 00:00:00 2001
+From 801cb49886873b5da153e57174da8582a768e805 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:48:47 +0530
-Subject: [PATCH 15/18] nvme-pci: acquire the dma-buf active reference at
+Subject: [PATCH 16/19] nvme-pci: acquire the dma-buf active reference at
  hardware submission
 
 Wire nvme into map->active, taken and dropped at the actual hardware
@@ -88,10 +88,10 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  3 files changed, 162 insertions(+), 12 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index a7c789654054..f77203b101ac 100644
+index 4a7363638b3e..e2d6b765ce30 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
-@@ -215,7 +215,6 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+@@ -184,7 +184,6 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
  
  	/* Return a caller reference in addition to the publication reference. */
  	kref_get(&map->refs);
@@ -396,10 +396,10 @@ index 868524ca3575..cf7218940480 100644
  	iod->nr_descriptors = 0;
  	iod->total_len = 0;
 diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
-index f9c2241ce60c..1195f279fd60 100644
+index c0cc0b21e3f3..717c1a9a0032 100644
 --- a/include/linux/dma-buf-io.h
 +++ b/include/linux/dma-buf-io.h
-@@ -51,8 +51,8 @@ struct dma_buf_io_map {
+@@ -40,8 +40,8 @@ struct dma_buf_io_map {
  	struct kref			refs;
  
  	/*
@@ -410,7 +410,7 @@ index f9c2241ce60c..1195f279fd60 100644
  	 */
  	struct percpu_ref		active;
  
-@@ -110,6 +110,7 @@ static inline void dma_buf_io_map_active_put(struct dma_buf_io_map *map)
+@@ -99,6 +99,7 @@ static inline void dma_buf_io_map_active_put(struct dma_buf_io_map *map)
  	percpu_ref_put(&map->active);
  }
  

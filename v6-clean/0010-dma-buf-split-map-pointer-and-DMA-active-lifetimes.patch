@@ -1,7 +1,7 @@
 From 72ead6e537cce9c603b9e250f9388b627c386c7d Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Fri, 11 Sep 2026 14:18:22 +0530
-Subject: [PATCH 10/18] dma-buf: split map pointer and DMA-active lifetimes
+Subject: [PATCH 10/19] dma-buf: split map pointer and DMA-active lifetimes
 
 The map reference currently covers both software pointer holders and
 device access to the DMA mapping. Importers can hold it across

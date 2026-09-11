@@ -1,7 +1,7 @@
-From f5e1d26bf0a980c2d76db65bfddae9a1bb87554f Mon Sep 17 00:00:00 2001
+From 217bb0187060e66f9046802de57a79105a51659d Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:54:10 +0530
-Subject: [PATCH 17/18] dma-buf: defer percpu_ref_exit() to the map's final
+Subject: [PATCH 18/19] dma-buf: defer percpu_ref_exit() to the map's final
  release
 
 percpu_ref_exit()'s documented contract is that the caller ensures the
@@ -47,7 +47,7 @@ Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
  1 file changed, 11 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
-index f77203b101ac..f0164314e5b0 100644
+index e2d6b765ce30..b99fb6a00b4b 100644
 --- a/drivers/dma-buf/dma-buf-io.c
 +++ b/drivers/dma-buf/dma-buf-io.c
 @@ -68,6 +68,7 @@ static void dma_buf_io_map_free_rcu(struct rcu_head *rcu)
@@ -58,7 +58,7 @@ index f77203b101ac..f0164314e5b0 100644
  	kfree(map);
  	dma_buf_io_ctx_put(ctx);
  }
-@@ -98,7 +99,10 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+@@ -93,7 +94,10 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
  	dma_resv_unlock(dmabuf->resv);
  
  	dma_fence_put(fence);
@@ -70,8 +70,8 @@ index f77203b101ac..f0164314e5b0 100644
  	kref_put(&map->refs, __dma_buf_io_map_free);
  }
  
-@@ -253,7 +257,12 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
- 		/* Never dma_fence_init()'d on this path; plain kfree. */
+@@ -216,7 +220,12 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 		ctx->dev_ops->unmap(ctx, map);
  		kfree(map->fence);
  		map->fence = NULL;
 -		percpu_ref_exit(&map->active);

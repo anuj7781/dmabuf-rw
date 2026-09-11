@@ -1,7 +1,7 @@
 From 4601ab710d52f12b658619b941d04759efc695e9 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:20:08 +0530
-Subject: [PATCH 07/18] dma-buf: keep target file alive through ctx teardown
+Subject: [PATCH 07/19] dma-buf: keep target file alive through ctx teardown
 
 The DMA-BUF attachment retains a raw target device pointer. Keep its file
 open until ->release() detaches the attachment.

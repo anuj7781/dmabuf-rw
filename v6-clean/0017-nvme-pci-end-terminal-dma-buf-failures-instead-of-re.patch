@@ -1,7 +1,7 @@
-From da7e2dfb7e38a6a9749af871ee09f7e40b28ef80 Mon Sep 17 00:00:00 2001
+From 73b96003db2d5c4118b526aca224d81928af0f31 Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:49:32 +0530
-Subject: [PATCH 16/18] nvme-pci: end terminal dma-buf failures instead of
+Subject: [PATCH 17/19] nvme-pci: end terminal dma-buf failures instead of
  requeuing them
 
 The previous commit made a dma-buf generation-loss rejection

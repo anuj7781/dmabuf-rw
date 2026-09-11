@@ -1,7 +1,7 @@
 From 28208dcbd77cb4ca42b42abf0a8e20956d88967d Mon Sep 17 00:00:00 2001
 From: Anuj Gupta <anuj20.g@samsung.com>
 Date: Thu, 10 Sep 2026 15:20:53 +0530
-Subject: [PATCH 11/18] dma-buf: do not leak ctx on ctx_release_work's
+Subject: [PATCH 11/19] dma-buf: do not leak ctx on ctx_release_work's
  WARN_ON_ONCE paths
 
 dma_buf_io_ctx_release_work(), added by patch 1 of "Add dmabuf read/write

@@ -1,4 +1,4 @@
-# Mapping: `anuj/dmabuf-v6-lifetime` (6 commits) -> `anuj/dmabuf-v6-clean` (18 commits)
+# Mapping: `anuj/dmabuf-v6-lifetime` (6 commits) -> `anuj/dmabuf-v6-clean` (19 commits)
 
 Old branch, discovery-ordered:
 
@@ -25,18 +25,19 @@ head (`71c75106fd3c`) rather than on old commit 1:
 | 9 | `dma-buf: pin I/O contexts while releasing their maps` | 1 (the ctx-pin-timing half only: unconditional `refcount_inc()` in `dma_buf_io_init_map()`, replacing the check-then-increment TOCTOU Christian flagged on v4 -- still v5's original single `percpu_ref`, no kref/active split yet) |
 | 10 | `dma-buf: split map pointer and DMA-active lifetimes` | 1 (the kref/active split and RCU-delayed free) -- **redesigned**; see below |
 | 11 | `dma-buf: do not leak ctx on ctx_release_work's WARN_ON_ONCE paths` | 3 (the teardown-WARN leak half) -- placed after commit 10; see "Ordering fix" below |
-| 12 | `dma-buf: initialise the drain fence after reserving its slot` | 1 (the fence-ordering half: `dma_fence_init()` moved past `dma_resv_reserve_fences()`, `release_mode`, the sync-drain fallback, and the signal moved out of the worker) |
-| 13 | `dma-buf: run deferred unmap on a WQ_MEM_RECLAIM workqueue` | 1 (the dedicated workqueue half, landed *after* 12 -- the original commit's title claimed this made signalling safe, which was never true; that is commit 12's doing) |
-| 14 | `io_uring/rsrc: re-import when the cached dma-buf map is stale` | 3 (the `io_dmabuf_reuse_map()` half) |
-| 15 | `nvme-pci: acquire the dma-buf active reference at hardware submission` | 2 + 4 (active-ref funnel, `nvme_iod::flags` widened to `u16` in the same commit that adds `IOD_DMABUF_ACTIVE` rather than as a separate follow-up fixing a bug that commit itself introduced, setup-failure rollback, **and** the io_uring-side removal of the import-time active acquisition -- old commit 2 never did this half, leaving the reference double-acquired until this rewrite) |
-| 16 | `nvme-pci: end terminal dma-buf failures instead of requeuing them` | 2 (the `nvme_prep_rq_batch()`/`nvme_queue_rqs()` batch-status half) |
-| 17 | `dma-buf: defer percpu_ref_exit() to the map's final release` | new territory, not attempted on the old branch -- with active-ref acquisition decoupled from import (15), a kref-holding request can attempt a fresh `active_tryget()` after `percpu_ref_exit()` has already run, in **both** the FENCED worker and the SYNC fallback path |
-| 18 | `dma-buf: annotate the fence signalling critical section` | new -- `dma_fence_begin/end_signalling()` around the release callback, with the commit message explicit that nvme's timeout/reset/PCI-recovery escalation is *not* covered |
+| 12 | `dma-buf: signal the drain fence from the active release` | 1 (signal as soon as active users drain instead of making signalling depend on the unmap worker) |
+| 13 | `dma-buf: initialise the drain fence after reserving its slot` | 1 (the fence-ordering half: delay `dma_fence_init()` until after `dma_resv_reserve_fences()`, with a synchronous fallback when reservation fails) |
+| 14 | `dma-buf: run deferred unmap on a WQ_MEM_RECLAIM workqueue` | 1 (the dedicated workqueue half, landed after signalling was removed from the worker in 12) |
+| 15 | `io_uring/rsrc: re-import when the cached dma-buf map is stale` | 3 (the `io_dmabuf_reuse_map()` half) |
+| 16 | `nvme-pci: acquire the dma-buf active reference at hardware submission` | 2 + 4 (active-ref funnel, `nvme_iod::flags` widened to `u16` in the same commit that adds `IOD_DMABUF_ACTIVE` rather than as a separate follow-up fixing a bug that commit itself introduced, setup-failure rollback, **and** the io_uring-side removal of the import-time active acquisition -- old commit 2 never did this half, leaving the reference double-acquired until this rewrite) |
+| 17 | `nvme-pci: end terminal dma-buf failures instead of requeuing them` | 2 (the `nvme_prep_rq_batch()`/`nvme_queue_rqs()` batch-status half) |
+| 18 | `dma-buf: defer percpu_ref_exit() to the map's final release` | new territory, not attempted on the old branch -- with active-ref acquisition decoupled from import (16), a kref-holding request can attempt a fresh `active_tryget()` after `percpu_ref_exit()` has already run, in **both** the FENCED worker and the SYNC fallback path |
+| 19 | `dma-buf: annotate the fence signalling critical section` | new -- `dma_fence_begin/end_signalling()` around the release callback, with the commit message explicit that nvme's timeout/reset/PCI-recovery escalation is *not* covered |
 
 ## Not carried forward as separate commits
 
 - **`IOD_FLAGS_LAST` sentinel + `BUILD_BUG_ON`** (old commit 4): folded into
-  new commit 15. In a correctly-ordered history there is no moment where
+  new commit 16. In a correctly-ordered history there is no moment where
   `nvme_iod::flags` is deliberately too narrow, so there is nothing for a
   standalone "widen" commit to fix -- the field is declared `u16` in the same
   commit that introduces the bit needing it.
@@ -65,7 +66,7 @@ Verified before implementing:
 - The synchronous reserve-failure fallback drops exactly one publication
   kref and leaves the ctx pin for the RCU callback -- no direct
   `dma_buf_io_ctx_put()` call remains in that path.
-- After the nvme boundary-move commit (15), any code holding a kref on a
+- After the nvme boundary-move commit (16), any code holding a kref on a
   map can rely on `map->ctx` without a separate pin of its own -- this
   retroactively covers the `map->ctx` dereference in
   `nvme_ns_head_submit_bio()` (the local multipath commit, out of scope
@@ -137,7 +138,7 @@ signals).
 
 ## Known divergence from the old branch (intentional)
 
-- Commit 15 removes the import-time `percpu_ref_get()`/`tryget()` calls
+- Commit 16 removes the import-time `percpu_ref_get()`/`tryget()` calls
   from `dma_buf_io_get_map()` / `dma_buf_io_create_map()` in the same diff
   that adds nvme's submission-time acquisition. The old branch's commit 2
   never did this -- on `anuj/dmabuf-v6-lifetime`, `map->active` is
@@ -153,7 +154,7 @@ signals).
 
 ## Verification
 
-- All 18 commits build clean at `W=1` (`drivers/dma-buf/dma-buf-io.o`,
+- All 19 commits build clean at `W=1` (`drivers/dma-buf/dma-buf-io.o`,
   `drivers/nvme/host/pci.o`, `io_uring/rsrc.o`), verified individually via
   `git rebase --exec`, and pass `checkpatch.pl --strict` with 0
   errors/warnings/checks, all re-run after the commit 9/10 redesign and the
