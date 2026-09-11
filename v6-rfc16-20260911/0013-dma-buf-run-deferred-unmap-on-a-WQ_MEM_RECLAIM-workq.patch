@@ -1,0 +1,51 @@
+From ef96e34e322d1ef9f35d36aa63975cf06ac7d618 Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 15:40:08 +0530
+Subject: [PATCH 13/16] dma-buf: run deferred unmap on a WQ_MEM_RECLAIM
+ workqueue
+
+An exporter reclaiming the buffer can wait for the importer to unmap
+it. Run deferred unmap on a dedicated WQ_MEM_RECLAIM workqueue so
+system workqueue saturation cannot stall teardown.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index 294cb8edef73..86ad8f848f96 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -8,6 +8,9 @@
+ #include <linux/dma-resv.h>
+ #include <linux/file.h>
+ 
++/* Keep deferred unmap work available under memory pressure. */
++static struct workqueue_struct *dma_buf_io_wq;
++
+ static const char *dma_buf_io_fence_drv_name(struct dma_fence *fence)
+ {
+ 	return "dma-buf-io-ctx";
+@@ -94,7 +97,7 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ 
+ 	dma_fence_signal(map->fence);
+ 	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
+-	queue_work(system_wq, &map->release_work);
++	queue_work(dma_buf_io_wq, &map->release_work);
+ }
+ 
+ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+@@ -293,3 +296,12 @@ int dma_buf_io_ctx_create(struct file *file,
+ 
+ 	return ret;
+ }
++
++static int __init dma_buf_io_init(void)
++{
++	dma_buf_io_wq = alloc_workqueue("dma_buf_io", WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
++	if (!dma_buf_io_wq)
++		return -ENOMEM;
++	return 0;
++}
++subsys_initcall(dma_buf_io_init);
+-- 
+2.43.0
+

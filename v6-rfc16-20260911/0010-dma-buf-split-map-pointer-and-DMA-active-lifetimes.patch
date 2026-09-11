@@ -1,0 +1,201 @@
+From 2d2f7c2181a590cf8ae1939b6fe37d801ca52e3c Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Fri, 11 Sep 2026 14:18:22 +0530
+Subject: [PATCH 10/16] dma-buf: split map pointer and DMA-active lifetimes
+
+Software users can retain a map pointer while I/O preparation sleeps
+or allocates memory, but invalidation only needs to wait for users
+that can access the DMA mapping.
+
+Use a kref to protect the map and its context, and retain the
+percpu_ref as the gate for active DMA access. Free the map through
+RCU after all software references are gone.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index 7747a3a1738f..432cf97cf2ab 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -49,6 +49,23 @@ static void dma_buf_io_ctx_put(struct dma_buf_io_ctx *ctx)
+ 		queue_work(system_wq, &ctx->destroy_work);
+ }
+ 
++static void dma_buf_io_map_free_rcu(struct rcu_head *rcu)
++{
++	struct dma_buf_io_map *map = container_of(rcu, struct dma_buf_io_map, rcu);
++	struct dma_buf_io_ctx *ctx = map->ctx;
++
++	kfree(map);
++	dma_buf_io_ctx_put(ctx);
++}
++
++void __dma_buf_io_map_free(struct kref *kref)
++{
++	struct dma_buf_io_map *map = container_of(kref, struct dma_buf_io_map, refs);
++
++	call_rcu(&map->rcu, dma_buf_io_map_free_rcu);
++}
++EXPORT_SYMBOL_NS_GPL(__dma_buf_io_map_free, "DMA_BUF");
++
+ static void dma_buf_io_map_release_work(struct work_struct *work)
+ {
+ 	struct dma_buf_io_map *map = container_of(work, struct dma_buf_io_map,
+@@ -69,15 +86,13 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ 	dma_resv_unlock(dmabuf->resv);
+ 
+ 	dma_fence_put(fence);
+-	percpu_ref_exit(&map->refs);
+-	kfree(map);
+-
+-	dma_buf_io_ctx_put(ctx);
++	percpu_ref_exit(&map->active);
++	kref_put(&map->refs, __dma_buf_io_map_free);
+ }
+ 
+-static void dma_buf_io_map_refs_release(struct percpu_ref *ref)
++static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ {
+-	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, refs);
++	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
+ 
+ 	/* might sleep, use a worker */
+ 	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
+@@ -93,7 +108,8 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+ 	if (!fence)
+ 		return -ENOMEM;
+ 
+-	ret = percpu_ref_init(&map->refs, dma_buf_io_map_refs_release, 0, GFP_KERNEL);
++	ret = percpu_ref_init(&map->active, dma_buf_io_map_active_release, 0,
++			      GFP_KERNEL);
+ 	if (ret) {
+ 		kfree(fence);
+ 		return ret;
+@@ -103,8 +119,9 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map)
+ 		       atomic_inc_return(&ctx->fence_seq));
+ 	map->fence = fence;
+ 	map->ctx = ctx;
++	kref_init(&map->refs);
+ 
+-	/* Keep ctx alive through deferred map teardown. */
++	/* Keep ctx alive until the map's final release. */
+ 	refcount_inc(&ctx->refs);
+ 	return 0;
+ }
+@@ -147,14 +164,15 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 	if (WARN_ON_ONCE(!map->seg_shift)) {
+ 		ctx->dev_ops->unmap(ctx, map);
+ 		dma_fence_put(map->fence);
+-		percpu_ref_exit(&map->refs);
+-		kfree(map);
+-		dma_buf_io_ctx_put(ctx);
++		percpu_ref_exit(&map->active);
++		kref_put(&map->refs, __dma_buf_io_map_free);
+ 		ret = -EFAULT;
+ 		goto out;
+ 	}
+ 
+-	percpu_ref_get(&map->refs);
++	/* Return a caller reference in addition to the publication reference. */
++	kref_get(&map->refs);
++	percpu_ref_get(&map->active);
+ 	rcu_assign_pointer(ctx->map, map);
+ out:
+ 	dma_resv_unlock(dmabuf->resv);
+@@ -182,7 +200,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 		struct dma_fence *fence = map->fence;
+ 
+ 		dma_fence_get(fence);
+-		percpu_ref_kill(&map->refs);
++		percpu_ref_kill(&map->active);
+ 		dma_fence_wait(fence, false);
+ 		dma_fence_put(fence);
+ 		return;
+@@ -193,7 +211,7 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 	 * Delay destruction until all inflight requests using the map are
+ 	 * gone. It'll also signal the fence then.
+ 	 */
+-	percpu_ref_kill(&map->refs);
++	percpu_ref_kill(&map->active);
+ }
+ 
+ void dma_buf_io_invalidate_mappings(struct dma_buf_io_ctx *ctx)
+diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
+index 867709f84fc5..06686d8f266a 100644
+--- a/include/linux/dma-buf-io.h
++++ b/include/linux/dma-buf-io.h
+@@ -3,6 +3,8 @@
+ #define __DMA_BUF_IO_H__
+ 
+ #include <linux/dma-buf.h>
++#include <linux/kref.h>
++#include <linux/rcupdate.h>
+ 
+ struct dma_buf_io_ctx;
+ struct dma_buf_io_map;
+@@ -28,11 +30,14 @@ struct dma_buf_io_ops {
+ };
+ 
+ struct dma_buf_io_map {
++	/* Keeps the map and map->ctx alive for software pointer holders. */
++	struct kref			refs;
++
+ 	/*
+-	 * Counts attached requests and other users. Device specific unmapping
+-	 * is deferred until all refs are dropped.
++	 * Gates DMA-map access. Killed on invalidation and drained before
++	 * ->unmap().
+ 	 */
+-	struct percpu_ref		refs;
++	struct percpu_ref		active;
+ 
+ 	/*
+ 	 * DMA segment-length granularity, as a power-of-2 shift, for bounding
+@@ -43,6 +48,7 @@ struct dma_buf_io_map {
+ 	struct work_struct		release_work;
+ 	struct dma_fence		*fence;
+ 	struct dma_buf_io_ctx		*ctx;
++	struct rcu_head			rcu;
+ };
+ 
+ struct dma_buf_io_ctx {
+@@ -72,6 +78,18 @@ void dma_buf_io_ctx_release(struct dma_buf_io_ctx *ctx);
+ 
+ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx);
+ 
++void __dma_buf_io_map_free(struct kref *kref);
++
++static inline bool dma_buf_io_map_active_tryget(struct dma_buf_io_map *map)
++{
++	return percpu_ref_tryget_live(&map->active);
++}
++
++static inline void dma_buf_io_map_active_put(struct dma_buf_io_map *map)
++{
++	percpu_ref_put(&map->active);
++}
++
+ static inline struct dma_buf_io_map *
+ dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
+ {
+@@ -80,7 +98,7 @@ dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
+ 	guard(rcu)();
+ 
+ 	map = rcu_dereference(ctx->map);
+-	if (unlikely(!map || !percpu_ref_tryget_live_rcu(&map->refs)))
++	if (unlikely(!map || !kref_get_unless_zero(&map->refs)))
+ 		return NULL;
+ 
+ 	return map;
+@@ -88,7 +106,7 @@ dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
+ 
+ static inline void dma_buf_io_map_drop(struct dma_buf_io_map *map)
+ {
+-	percpu_ref_put(&map->refs);
++	kref_put(&map->refs, __dma_buf_io_map_free);
+ }
+ 
+ /*
+-- 
+2.43.0
+

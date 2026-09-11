@@ -1,0 +1,323 @@
+From b73b7092fa36bb703033ff01c51af57c5916de5d Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 15:48:47 +0530
+Subject: [PATCH 15/16] nvme-pci: acquire the dma-buf active reference at
+ hardware submission
+
+Holding the active reference throughout I/O preparation allows
+reclaim-capable allocations to delay fence signalling. Acquire it in
+the NVMe submission path immediately before the driver first accesses
+the DMA mapping.
+
+Release the reference on completion and every setup failure. Treat
+generation loss as terminal and preserve that status in batched
+submissions instead of requeueing the request against the same map.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index 86ad8f848f96..a52386cdc964 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -173,7 +173,6 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 
+ 	/* Return a caller reference in addition to the publication reference. */
+ 	kref_get(&map->refs);
+-	percpu_ref_get(&map->active);
+ 	rcu_assign_pointer(ctx->map, map);
+ out:
+ 	dma_resv_unlock(dmabuf->resv);
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 868524ca3575..e553390bfc0c 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -427,6 +427,12 @@ enum nvme_iod_flags {
+ 
+ 	/* Metadata using non-coalesced MPTR */
+ 	IOD_SINGLE_META_SEGMENT	= 1U << 7,
++
++	/* Request holds the dma-buf active reference. */
++	IOD_DMABUF_ACTIVE	= 1U << 8,
++
++	/* Keep last; used to verify the flags field width. */
++	IOD_FLAGS_LAST,
+ };
+ 
+ struct nvme_dma_vec {
+@@ -440,7 +446,7 @@ struct nvme_dma_vec {
+ struct nvme_iod {
+ 	struct nvme_request req;
+ 	struct nvme_command cmd;
+-	u8 flags;
++	u16 flags;
+ 	u8 nr_descriptors;
+ 
+ 	size_t total_len;
+@@ -874,13 +880,54 @@ to_nvme_dmabuf_map(struct dma_buf_io_map *map)
+ 	return container_of(map, struct nvme_dmabuf_map, base);
+ }
+ 
++/* Terminal status for a request whose dma-buf map was invalidated. */
++#define NVME_STS_DMABUF_GENERATION_LOST	BLK_STS_IOERR
++
++/* Acquire the active reference before accessing the driver DMA map. */
++static bool nvme_dmabuf_tryget_active(struct request *req)
++{
++	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
++
++	BUILD_BUG_ON((IOD_FLAGS_LAST - 1) > (typeof(iod->flags))~0U);
++
++	if (WARN_ON_ONCE(iod->flags & IOD_DMABUF_ACTIVE))
++		return true;
++
++	if (!dma_buf_io_map_active_tryget(req->bio->bi_dmabuf_map))
++		return false;
++
++	iod->flags |= IOD_DMABUF_ACTIVE;
++	return true;
++}
++
++/* Release the active reference, if this request acquired one. */
++static void nvme_dmabuf_put_active(struct request *req)
++{
++	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
++
++	if (!(iod->flags & IOD_DMABUF_ACTIVE))
++		return;
++
++	iod->flags &= ~IOD_DMABUF_ACTIVE;
++	dma_buf_io_map_active_put(req->bio->bi_dmabuf_map);
++}
++
++/* Access driver DMA state while the active reference is held. */
++static inline struct nvme_dmabuf_map *nvme_req_dmabuf_map(struct request *req)
++{
++	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
++
++	WARN_ON_ONCE(!(iod->flags & IOD_DMABUF_ACTIVE));
++	return to_nvme_dmabuf_map(req->bio->bi_dmabuf_map);
++}
++
+ static void nvme_dmabuf_map_sync_for_cpu(struct nvme_dev *nvme_dev,
+ 					 struct request *req)
+ {
+ 	struct device *dev = nvme_dev->dev;
+ 	enum dma_data_direction dma_dir;
+ 	struct bio *bio = req->bio;
+-	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
++	struct nvme_dmabuf_map *map = nvme_req_dmabuf_map(req);
+ 	dma_addr_t *dma_list = map->dma_list;
+ 	unsigned offset = bio->bi_iter.bi_offset;
+ 	unsigned map_idx = offset / NVME_CTRL_PAGE_SIZE;
+@@ -902,7 +949,7 @@ static void nvme_dmabuf_map_sync_for_device(struct nvme_dev *nvme_dev,
+ 	struct device *dev = nvme_dev->dev;
+ 	enum dma_data_direction dma_dir;
+ 	struct bio *bio = req->bio;
+-	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
++	struct nvme_dmabuf_map *map = nvme_req_dmabuf_map(req);
+ 	dma_addr_t *dma_list = map->dma_list;
+ 	unsigned offset = bio->bi_iter.bi_offset;
+ 	unsigned map_idx = offset / NVME_CTRL_PAGE_SIZE;
+@@ -927,6 +974,8 @@ static void nvme_rq_clean_dmabuf_map(struct nvme_dev *dev,
+ 
+ 	if (!(iod->flags & IOD_SINGLE_SEGMENT))
+ 		nvme_free_descriptors(req);
++
++	nvme_dmabuf_put_active(req);
+ }
+ 
+ static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
+@@ -934,7 +983,7 @@ static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 	struct bio *bio = req->bio;
+-	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
++	struct nvme_dmabuf_map *map = nvme_req_dmabuf_map(req);
+ 	unsigned bvec_done = bio->bi_iter.bi_offset;
+ 	unsigned map_idx = bvec_done / NVME_CTRL_PAGE_SIZE;
+ 	unsigned offset = bvec_done & (NVME_CTRL_PAGE_SIZE - 1);
+@@ -964,8 +1013,11 @@ static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
+ 
+ 	prp_list = dma_pool_alloc(nvme_dma_pool(nvmeq, iod), GFP_ATOMIC,
+ 			&prp_dma);
+-	if (!prp_list)
++	if (!prp_list) {
++		/* Setup failure bypasses nvme_unmap_data(); roll back locally. */
++		nvme_dmabuf_put_active(req);
+ 		return BLK_STS_RESOURCE;
++	}
+ 
+ 	iod->descriptors[iod->nr_descriptors++] = prp_list;
+ 	prp2_dma = prp_dma;
+@@ -997,6 +1049,7 @@ static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
+ 	return BLK_STS_OK;
+ free_prps:
+ 	nvme_free_descriptors(req);
++	nvme_dmabuf_put_active(req);
+ 	return BLK_STS_RESOURCE;
+ }
+ 
+@@ -1309,10 +1362,14 @@ static void nvme_pci_sgl_set_seg(struct nvme_sgl_desc *sge,
+ 	sge->type = NVME_SGL_FMT_LAST_SEG_DESC << 4;
+ }
+ 
++/*
++ * Called from nvme_rq_setup_dmabuf() after its tryget, so the active
++ * reference is already held here.
++ */
+ static unsigned int nvme_pci_dmabuf_sgl_nents(struct request *req)
+ {
+ 	struct bio *bio = req->bio;
+-	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
++	struct nvme_dmabuf_map *map = nvme_req_dmabuf_map(req);
+ 	struct scatterlist *sg;
+ 	unsigned long tmp;
+ 	size_t offset = bio->bi_iter.bi_offset;
+@@ -1352,7 +1409,7 @@ static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 	struct bio *bio = req->bio;
+-	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
++	struct nvme_dmabuf_map *map = nvme_req_dmabuf_map(req);
+ 	size_t length = blk_rq_payload_bytes(req);
+ 	struct nvme_sgl_desc *sg_list = &iod->cmd.common.dptr.sgl;
+ 	bool pooled = entries > 1;
+@@ -1363,8 +1420,11 @@ static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
+ 	size_t offset = bio->bi_iter.bi_offset;
+ 	size_t remaining = length;
+ 
+-	if (!entries)
++	if (!entries) {
++		/* Setup failure bypasses nvme_unmap_data(); roll back locally. */
++		nvme_dmabuf_put_active(req);
+ 		return BLK_STS_IOERR;
++	}
+ 
+ 	iod->cmd.common.flags = NVME_CMD_SGL_METABUF;
+ 	iod->total_len = length;
+@@ -1378,8 +1438,10 @@ static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
+ 
+ 		sg_list = dma_pool_alloc(nvme_dma_pool(nvmeq, iod), GFP_ATOMIC,
+ 					 &sgl_dma);
+-		if (!sg_list)
++		if (!sg_list) {
++			nvme_dmabuf_put_active(req);
+ 			return BLK_STS_RESOURCE;
++		}
+ 		iod->descriptors[iod->nr_descriptors++] = sg_list;
+ 	}
+ 
+@@ -1423,6 +1485,7 @@ static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
+ 		iod->nr_descriptors--;
+ 		dma_pool_free(nvme_dma_pool(nvmeq, iod), sg_list, sgl_dma);
+ 	}
++	nvme_dmabuf_put_active(req);
+ 	return BLK_STS_IOERR;
+ }
+ 
+@@ -1432,6 +1495,10 @@ static blk_status_t nvme_rq_setup_dmabuf(struct request *req,
+ 	unsigned int entries;
+ 	size_t avg_seg;
+ 
++	/* Acquire the reference before accessing the DMA map. */
++	if (!nvme_dmabuf_tryget_active(req))
++		return NVME_STS_DMABUF_GENERATION_LOST;
++
+ 	if (use_sgl == SGL_UNSUPPORTED)
+ 		return nvme_rq_setup_dmabuf_map(req, nvmeq);
+ 
+@@ -1695,6 +1762,14 @@ static blk_status_t nvme_prep_rq(struct request *req)
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 	blk_status_t ret;
+ 
++	/*
++	 * A leaked active reference from a prior pass (this request being
++	 * requeued) would otherwise be silently erased by the flags reset
++	 * below, defeating exactly the path -- requeue -- most likely to
++	 * leak one. Must run before the reset.
++	 */
++	WARN_ON_ONCE(iod->flags & IOD_DMABUF_ACTIVE);
++
+ 	iod->flags = 0;
+ 	iod->nr_descriptors = 0;
+ 	iod->total_len = 0;
+@@ -1773,18 +1848,20 @@ static void nvme_submit_cmds(struct nvme_queue *nvmeq, struct rq_list *rqlist)
+ 	spin_unlock(&nvmeq->sq_lock);
+ }
+ 
+-static bool nvme_prep_rq_batch(struct nvme_queue *nvmeq, struct request *req)
++/* Preserve terminal preparation errors for batched requests. */
++static blk_status_t nvme_prep_rq_batch(struct nvme_queue *nvmeq,
++				       struct request *req)
+ {
+ 	/*
+ 	 * We should not need to do this, but we're still using this to
+ 	 * ensure we can drain requests on a dying queue.
+ 	 */
+ 	if (unlikely(!test_bit(NVMEQ_ENABLED, &nvmeq->flags)))
+-		return false;
++		return BLK_STS_DEV_RESOURCE;
+ 	if (unlikely(!nvme_check_ready(&nvmeq->dev->ctrl, req, true)))
+-		return false;
++		return BLK_STS_DEV_RESOURCE;
+ 
+-	return nvme_prep_rq(req) == BLK_STS_OK;
++	return nvme_prep_rq(req);
+ }
+ 
+ static void nvme_queue_rqs(struct rq_list *rqlist)
+@@ -1795,14 +1872,26 @@ static void nvme_queue_rqs(struct rq_list *rqlist)
+ 	struct request *req;
+ 
+ 	while ((req = rq_list_pop(rqlist))) {
++		blk_status_t ret;
++
+ 		if (nvmeq && nvmeq != req->mq_hctx->driver_data)
+ 			nvme_submit_cmds(nvmeq, &submit_list);
+ 		nvmeq = req->mq_hctx->driver_data;
+ 
+-		if (nvme_prep_rq_batch(nvmeq, req))
++		ret = nvme_prep_rq_batch(nvmeq, req);
++		switch (ret) {
++		case BLK_STS_OK:
+ 			rq_list_add_tail(&submit_list, req);
+-		else
++			break;
++		case BLK_STS_RESOURCE:
++		case BLK_STS_DEV_RESOURCE:
+ 			rq_list_add_tail(&requeue_list, req);
++			break;
++		default:
++			/* Generation loss is terminal, not a resource retry. */
++			blk_mq_end_request(req, ret);
++			break;
++		}
+ 	}
+ 
+ 	if (nvmeq)
+diff --git a/include/linux/dma-buf-io.h b/include/linux/dma-buf-io.h
+index c0cc0b21e3f3..717c1a9a0032 100644
+--- a/include/linux/dma-buf-io.h
++++ b/include/linux/dma-buf-io.h
+@@ -40,8 +40,8 @@ struct dma_buf_io_map {
+ 	struct kref			refs;
+ 
+ 	/*
+-	 * Gates DMA-map access. Killed on invalidation and drained before
+-	 * ->unmap().
++	 * Gates DMA-map access from hardware submission through completion.
++	 * Killed on invalidation and drained before ->unmap().
+ 	 */
+ 	struct percpu_ref		active;
+ 
+@@ -99,6 +99,7 @@ static inline void dma_buf_io_map_active_put(struct dma_buf_io_map *map)
+ 	percpu_ref_put(&map->active);
+ }
+ 
++/* This acquires only a software reference; active is driver-managed. */
+ static inline struct dma_buf_io_map *
+ dma_buf_io_get_map(struct dma_buf_io_ctx *ctx)
+ {
+-- 
+2.43.0
+

@@ -1,0 +1,35 @@
+From bebd5d5513c9047a74d71f634495bef80d3d909f Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Thu, 10 Sep 2026 14:52:12 +0530
+Subject: [PATCH 03/16] dma-buf: unwind map creation on missing seg_shift
+
+A map returned without segment granularity cannot be used by the
+block layer. Unmap it and release the initialized map resources before
+returning an error.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index 6834a79700ce..fbf91db5617e 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -148,8 +148,14 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 		goto out;
+ 	}
+ 
+-	if (WARN_ON_ONCE(!map->seg_shift))
+-		return ERR_PTR(-EFAULT);
++	if (WARN_ON_ONCE(!map->seg_shift)) {
++		ctx->dev_ops->unmap(ctx, map);
++		dma_fence_put(map->fence);
++		percpu_ref_exit(&map->refs);
++		kfree(map);
++		ret = -EFAULT;
++		goto out;
++	}
+ 
+ 	percpu_ref_get(&map->refs);
+ 	rcu_assign_pointer(ctx->map, map);
+-- 
+2.43.0
+
