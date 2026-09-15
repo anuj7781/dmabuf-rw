@@ -1,0 +1,137 @@
+From c6bb7cb798494f7780c89ec61402215502c2953e Mon Sep 17 00:00:00 2001
+From: Anuj Gupta <anuj20.g@samsung.com>
+Date: Tue, 15 Sep 2026 14:34:11 +0530
+Subject: [PATCH] DEBUG: dma-buf: trace file I/O map invalidation
+
+Trace map publication and invalidation, active NVMe users, drain fence publication and signalling, deferred unmap, and final map release. The common context, map, and fence identifiers make concurrent map generations distinguishable in the trace buffer.
+
+Signed-off-by: Anuj Gupta <anuj20.g@samsung.com>
+---
+ drivers/dma-buf/dma-buf-io.c | 18 ++++++++++++++++++
+ drivers/nvme/host/pci.c      | 13 ++++++++++++-
+ 2 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/dma-buf/dma-buf-io.c b/drivers/dma-buf/dma-buf-io.c
+index ca248cd1c5f5..0fff8d03ca51 100644
+--- a/drivers/dma-buf/dma-buf-io.c
++++ b/drivers/dma-buf/dma-buf-io.c
+@@ -57,6 +57,8 @@ static void dma_buf_io_map_free_rcu(struct rcu_head *rcu)
+ 	struct dma_buf_io_map *map = container_of(rcu, struct dma_buf_io_map, rcu);
+ 	struct dma_buf_io_ctx *ctx = map->ctx;
+ 
++	trace_printk("dmabuf-io map-free ctx=%p map=%p fence_ctx=%llu\n",
++		     ctx, map, ctx->fence_ctx);
+ 	percpu_ref_exit(&map->active);
+ 	kfree(map);
+ 	dma_buf_io_ctx_put(ctx);
+@@ -78,9 +80,13 @@ static void dma_buf_io_map_release_work(struct work_struct *work)
+ 	struct dma_buf_io_ctx *ctx = map->ctx;
+ 	struct dma_buf *dmabuf = ctx->dmabuf;
+ 
++	trace_printk("dmabuf-io unmap-start ctx=%p map=%p fence=%llu:%llu\n",
++		     ctx, map, fence->context, fence->seqno);
+ 	dma_resv_lock(dmabuf->resv, NULL);
+ 	ctx->dev_ops->unmap(ctx, map);
+ 	dma_resv_unlock(dmabuf->resv);
++	trace_printk("dmabuf-io unmap-done ctx=%p map=%p fence=%llu:%llu\n",
++		     ctx, map, fence->context, fence->seqno);
+ 
+ 	dma_fence_put(fence);
+ 	kref_put(&map->refs, __dma_buf_io_map_free);
+@@ -91,10 +97,14 @@ static void dma_buf_io_map_active_release(struct percpu_ref *ref)
+ 	struct dma_buf_io_map *map = container_of(ref, struct dma_buf_io_map, active);
+ 
+ 	if (map->release_mode == DMA_BUF_IO_RELEASE_SYNC) {
++		trace_printk("dmabuf-io sync-drained ctx=%p map=%p fence_ctx=%llu\n",
++			     map->ctx, map, map->ctx->fence_ctx);
+ 		complete(&map->drain);
+ 		return;
+ 	}
+ 
++	trace_printk("dmabuf-io fence-signal ctx=%p map=%p fence=%llu:%llu\n",
++		     map->ctx, map, map->fence->context, map->fence->seqno);
+ 	dma_fence_signal(map->fence);
+ 	INIT_WORK(&map->release_work, dma_buf_io_map_release_work);
+ 	queue_work(dma_buf_io_wq, &map->release_work);
+@@ -174,6 +184,8 @@ struct dma_buf_io_map *dma_buf_io_create_map(struct dma_buf_io_ctx *ctx)
+ 	/* Return a caller reference in addition to the publication reference. */
+ 	kref_get(&map->refs);
+ 	rcu_assign_pointer(ctx->map, map);
++	trace_printk("dmabuf-io map-publish ctx=%p map=%p fence_ctx=%llu\n",
++		     ctx, map, ctx->fence_ctx);
+ out:
+ 	dma_resv_unlock(dmabuf->resv);
+ 	if (ret < 0)
+@@ -194,11 +206,15 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 	if (!map)
+ 		return;
+ 	rcu_assign_pointer(ctx->map, NULL);
++	trace_printk("dmabuf-io map-unpublish ctx=%p map=%p fence_ctx=%llu\n",
++		     ctx, map, ctx->fence_ctx);
+ 
+ 	ret = dma_resv_reserve_fences(dmabuf->resv, 1);
+ 	if (WARN_ON_ONCE(ret)) {
+ 		/* No fence can be published, so drain synchronously. */
+ 		map->release_mode = DMA_BUF_IO_RELEASE_SYNC;
++		trace_printk("dmabuf-io sync-drain ctx=%p map=%p ret=%d\n",
++			     ctx, map, ret);
+ 		percpu_ref_kill(&map->active);
+ 		wait_for_completion(&map->drain);
+ 
+@@ -212,6 +228,8 @@ static void dma_buf_io_drop_map(struct dma_buf_io_ctx *ctx)
+ 	dma_fence_init(map->fence, &dma_buf_io_fence_ops, NULL, ctx->fence_ctx,
+ 		       atomic_inc_return(&ctx->fence_seq));
+ 	dma_resv_add_fence(dmabuf->resv, map->fence, DMA_RESV_USAGE_KERNEL);
++	trace_printk("dmabuf-io fence-publish ctx=%p map=%p fence=%llu:%llu\n",
++		     ctx, map, map->fence->context, map->fence->seqno);
+ 	map->release_mode = DMA_BUF_IO_RELEASE_FENCED;
+ 	/* Delay unmap until all active users are gone. */
+ 	percpu_ref_kill(&map->active);
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 5675fd28fbac..642042309962 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -885,13 +885,18 @@ to_nvme_dmabuf_map(struct dma_buf_io_map *map)
+ static bool nvme_dmabuf_tryget_active(struct request *req)
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
++	struct dma_buf_io_map *map = req->bio->bi_dmabuf_map;
++	bool active;
+ 
+ 	BUILD_BUG_ON((IOD_FLAGS_LAST - 1) > (typeof(iod->flags))~0U);
+ 
+ 	if (WARN_ON_ONCE(iod->flags & IOD_DMABUF_ACTIVE))
+ 		return true;
+ 
+-	if (!dma_buf_io_map_active_tryget(req->bio->bi_dmabuf_map))
++	active = dma_buf_io_map_active_tryget(map);
++	trace_printk("dmabuf-io active-get req=%p tag=%d map=%p active=%d\n",
++		     req, req->tag, map, active);
++	if (!active)
+ 		return false;
+ 
+ 	iod->flags |= IOD_DMABUF_ACTIVE;
+@@ -906,6 +911,8 @@ static void nvme_dmabuf_put_active(struct request *req)
+ 		return;
+ 
+ 	iod->flags &= ~IOD_DMABUF_ACTIVE;
++	trace_printk("dmabuf-io active-put req=%p tag=%d map=%p\n",
++		     req, req->tag, req->bio->bi_dmabuf_map);
+ 	dma_buf_io_map_active_put(req->bio->bi_dmabuf_map);
+ }
+ 
+@@ -2637,7 +2644,11 @@ static void nvme_dmabuf_invalidate_mappings(struct dma_buf_attachment *attach)
+ {
+ 	struct dma_buf_io_ctx *ctx = attach->importer_priv;
+ 
++	trace_printk("dmabuf-io invalidate-enter ctx=%p fence_ctx=%llu\n",
++		     ctx, ctx->fence_ctx);
+ 	dma_buf_io_invalidate_mappings(ctx);
++	trace_printk("dmabuf-io invalidate-return ctx=%p fence_ctx=%llu\n",
++		     ctx, ctx->fence_ctx);
+ }
+ 
+ const struct dma_buf_attach_ops nvme_dmabuf_importer_ops = {
+-- 
+2.43.0
+
